@@ -5,6 +5,6 @@
 # `unrecognized arguments: Documents/...`。
 set -euo pipefail
 
-OUT_DIR="/Users/bytedance/Library/Mobile Documents/iCloud~md~obsidian/Documents/陈日伟/MarginNote"
+OUT_DIR="/Users/bytedance/Library/Mobile Documents/iCloud~md~obsidian/Documents/陈日伟/09-MarginNote"
 
 python3 mn_export_tool.py --by-book --out "$OUT_DIR" "$@"

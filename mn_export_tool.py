@@ -618,6 +618,11 @@ class RenderOptions:
     # 书（罕见），就附 (1)/(2) 后缀；vault 里上次留下的同名文件不再触发
     # +(1)，让"原地更新"成为默认行为，保留 mtime/ctime。
     generated_paths: set[str] | None = None
+    # 本书内**所有 note 的 excerpt（划线原文）归一化集合**。用于剥掉批注里
+    # 跟独立划线重复的段落：原则是"原文是基础，批注是附加，重复时删批注、
+    # 保留划线 quote"。渲染时若批注里某段的归一化字符串落在这个集合里，就
+    # 把那段从 callout 中删掉；若整条 comment 被剥空则不再输出 callout。
+    excerpt_norms_in_book: set[str] | None = None
 
 
 @dataclass
@@ -1653,6 +1658,54 @@ def _emit_image_para(
     return True
 
 
+def _strip_paragraphs_in_set(text: str, excerpt_norms: set[str] | None) -> str:
+    """从 `text`（批注）里剥掉那些与本书内某条独立划线 excerpt 一字不差的段落。
+
+    规则：
+    - 段落分割：先按双空行（``\\n\\s*\\n``）拆，再按单换行兜底拆短段。
+    - 归一化：仅折叠空白做比较（不归一化标点 / 中英文差异）。
+    - 长度护栏：段落长度 < 12 字符不参与匹配，避免短句误伤（如 "嗯"、"对"）。
+    - 至少要剥掉一段才返回新文本；若没有段落命中，原样返回，避免把"我的批注"
+      正常段落里的换行变形。
+
+    返回剥后剩余的批注文本（可能为 ""）。
+    """
+    if not text or not excerpt_norms:
+        return text
+    paras = re.split(r"\n\s*\n", text)
+    kept: list[str] = []
+    changed = False
+    for p in paras:
+        ps = p.strip()
+        if not ps:
+            kept.append(p)
+            continue
+        norm = re.sub(r"\s+", "", ps)
+        if len(norm) >= 12 and norm in excerpt_norms:
+            changed = True
+            continue
+        kept.append(p)
+    if not changed:
+        return text
+    return "\n\n".join(kept).strip()
+
+
+def _comment_equals_excerpt(comment: str, excerpt: str) -> bool:
+    """判定批注内容是否和原文摘录完全相同（仅折叠空白做比较）。
+
+    背景：MarginNote 用户有时会把整段原文复制粘贴到批注栏当作"标记 / 收藏"
+    操作，导出到 weread 风格时这就让 `> 划线 quote` 和紧跟着的
+    `> [!note]+ 💭 我的批注` callout 显示**同一段文字两次**——视觉上冗余。
+    用此函数判定后，调用方应把 comment 清空，跳过 callout，仅保留划线段。
+
+    判定口径：折叠所有空白后逐字符相等。不做更激进的归一化（中文逗号 vs
+    顿号等差异要保留差异 → 视为不同的批注）。
+    """
+    if not comment or not excerpt:
+        return False
+    return re.sub(r"\s+", "", comment) == re.sub(r"\s+", "", excerpt)
+
+
 def _emit_comment_para(
     comment: str,
     lines: list[str],
@@ -1790,6 +1843,15 @@ def _render_book_node_weread(
     image_data = _resolve_note_image(note, media_map, note_hash_map)
     redundant = _is_redundant(title, excerpt)
     excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    # A. 跳过和本节点原文一字不差的"伪批注"：用户在 MarginNote 里把整段原文
+    #    复制到批注框做"标记"动作，会让 `> 划线 quote` 和 `[!note]+ 💭 我的批注`
+    #    callout 显示同一段文字。
+    if comment and _comment_equals_excerpt(comment, excerpt_to_show):
+        comment = ""
+    # B. 跨 note 去重：把批注里和本书其它划线一字不差的段落从 callout 中剥
+    #    掉。原则是"原文是基础，批注是附加，重复时删批注、保留划线 quote"。
+    if comment:
+        comment = _strip_paragraphs_in_set(comment, options.excerpt_norms_in_book)
     has_body = (
         bool(excerpt_to_show) or bool(comment) or bool(image_data) or bool(card_link_ids)
     )
@@ -1910,6 +1972,12 @@ def _render_flat_book_note_weread(
     comment, card_link_ids = _split_card_links(comment)
     redundant = _is_redundant(title_text, excerpt)
     excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    # A. 跳过批注 == 原文 的冗余批注。
+    if comment and _comment_equals_excerpt(comment, excerpt_to_show):
+        comment = ""
+    # B. 把批注里和本书其它划线一字不差的段落从 callout 中剥掉，保留划线优先。
+    if comment:
+        comment = _strip_paragraphs_in_set(comment, options.excerpt_norms_in_book)
     page = n["ZSTARTPAGE"] or None
     backlink = _backlink(n["ZNOTEID"], page, options.url_scheme)
     block_id = _short_block_id(n["ZNOTEID"])
@@ -2216,8 +2284,21 @@ def export_book(
             first_line = excerpt_lbl.splitlines()[0].strip()
             card_labels[nid] = first_line
 
+    # 6.6 收集本书所有 note 的 excerpt 归一化集合，用于在渲染阶段剥掉批注里
+    #     和某条独立划线一字不差的段落（"原文是基础，批注是附加，重复时删批
+    #     注、保留划线"）。
+    excerpt_norms: set[str] = set()
+    for r in rows:
+        e_text = clean_text(r["ZHIGHLIGHT_TEXT"] or "").strip()
+        if not e_text:
+            continue
+        norm = re.sub(r"\s+", "", e_text)
+        if len(norm) >= 12:
+            excerpt_norms.add(norm)
+
     book_options = dataclasses.replace(
         options, image_dir_relative=image_rel, card_labels=card_labels,
+        excerpt_norms_in_book=excerpt_norms,
     )
 
     # 7. 标签：优先用 MarginNote 主页书架打的分类（区分性强），叠加用户在批注里写的 hashtag
@@ -2355,35 +2436,21 @@ def export_book(
     fm["primaryTopic"] = main_meta["title"]
     if last_update:
         fm["lastNoteUpdate"] = last_update
+    # MarginNote 跳回链接：从原本 `# 元数据` callout 里挪到 frontmatter，便于
+    # 在 Obsidian "笔记属性" 面板就能点开跳回 MarginNote，且避免和上方面板内
+    # 容重复呈现。
+    if main_tid:
+        fm["marginnote"] = f"{book_options.url_scheme}://notebook/{main_tid}"
     fm["tags"] = tags
     fm["source"] = ctx.app_name
     frontmatter = render_frontmatter(fm)
 
-    # 12. 头部 `# 元数据` callout（对齐 weread plugin 的 `> [!abstract]` 样式）
+    # 12. 头部仅保留 H1 标题。原本的 `# 元数据 / > [!abstract] ...` callout
+    #     已下线 —— 它和 Obsidian 顶部"笔记属性"面板（frontmatter）展示的
+    #     信息完全重复，纯视觉冗余。MarginNote 跳回链接已挪到 frontmatter
+    #     `marginnote` 字段。
     head_block: list[str] = []
     head_block.append(f"# {title}")
-    head_block.append("")
-    head_block.append("# 元数据")
-    head_block.append(f"> [!abstract] {title}")
-    head_block.append(f"> - 书名：{title}")
-    if author:
-        head_block.append(f"> - 作者：{author}")
-    head_block.append(f"> - 笔记数：{stats.note_count}")
-    if reviews:
-        head_block.append(f"> - 划线评论：{len(reviews)}")
-    primary_kind = "🧠" if main_meta["is_mindmap"] else "📖"
-    head_block.append(f"> - 主结构：{primary_kind} {main_meta['title']}")
-    if len(all_sources) > 1:
-        srcs = "、".join(
-            ("🧠 " + t if m else "📖 " + t) for t, m in all_sources.items()
-            if t != main_meta["title"]
-        )
-        head_block.append(f"> - 其它来源：{srcs}")
-    if is_merged:
-        head_block.append(f"> - 合并来源：{len(md5_list)} 份同名兜底笔记")
-    # MarginNote 跳回链接：用主 Topic 的 ZTOPICID
-    if main_tid:
-        head_block.append(f"> - MarginNote：{book_options.url_scheme}://notebook/{main_tid}")
     head_block.append("")
 
     # 13. 拼接 final
@@ -2398,6 +2465,19 @@ def export_book(
         body_lines.append("# 其它 Topic 的补充笔记")
         body_lines.append("")
         body_lines.extend(standalone_body)
+
+    # 13.5 防止生成"空导出"：MarginNote 里有时一本书的 ZBOOKNOTE 全是占位
+    # （ZTYPE=6 目录节点 / 空 mindmap 容器），rows 不空但所有节点要么被
+    # `_prune_empty_branches` 剪掉，要么被去重剥光，最终 body_lines 空着。
+    # 这种情况下不应该在 vault 里留个只有 frontmatter + H1 的空壳文件。
+    has_real_body = bool(body_lines) and stats.note_count > 0
+    if not has_real_body:
+        # 把刚才占位的 file_path 从本次运行的"已生成"集合里撤回，让它后续
+        # 被 _prune_orphans 当孤儿清理掉（如果之前导过同名文件的话）。
+        if in_run_paths is not None:
+            in_run_paths.discard(file_path)
+        return None
+
     final = frontmatter + "\n" + "\n".join(head_block + body_lines).rstrip() + "\n"
     changed = _write_if_changed(file_path, final)
 

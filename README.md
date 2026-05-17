@@ -55,25 +55,16 @@ bookMd5: "..."
 title: "..."
 author: "..."
 noteCount: 19
-reviewCount: 3   # 仅作 frontmatter 计数，不再单独渲染章节
+reviewCount: 3            # 仅作 frontmatter 计数，不再单独渲染章节
 imageCount: 0
 sourceTopics: [...]
 primaryTopic: "..."
-exported: "..."
+lastNoteUpdate: "..."     # 取本书所有笔记的最大更新时间，用于增量同步
+marginnote: "marginnote4app://notebook/<ZTOPICID>"   # 一键跳回 MarginNote
 tags: [...]
 source: "MarginNote 4"
 ---
 # 书名
-
-# 元数据
-> [!abstract] 书名
-> - 书名：xxx
-> - 作者：xxx
-> - 笔记数：19
-> - 划线评论：3
-> - 主结构：🧠 主 Topic
-> - 其它来源：📖 X、🧠 Y
-> - MarginNote：marginnote4app://notebook/<ZTOPICID>
 
 # 高亮划线
 
@@ -89,8 +80,9 @@ source: "MarginNote 4"
 
 要点：
 
+- frontmatter（顶部"笔记属性"面板）已包含书名、计数、来源、跳回链接等所有元信息，**不再额外渲染** `# 元数据 / > [!abstract] ...` callout，避免和 Obsidian 的属性面板视觉重复。
 - **`# 高亮划线`** 主体：每条原文是独立的 quote 段落 `>  text  [p.X](url)`，紧跟其后的 `[!note]+ 💭 我的批注` callout 就地展示该笔记的批注内容，方便上下文阅读。
-- 历史曾有 `# 读书笔记 / ### 划线评论` 段把有批注的笔记再单列一份，但跟上方 callout 完全重复，已下线。`reviewCount` 字段仍保留作 frontmatter 索引。如果想做"全 vault 批注汇总"，用 Obsidian Dataview / Backlinks 即可。
+- 批注与划线去重：当批注内容和某条独立划线一字不差时，**保留划线、删批注**（"原文是基础，批注是附加"）。批注里若混有部分重复 + 部分独有的段落，则只把重复段落剥掉、保留独有部分。
 - **`> [!quote]- 💬 来自《X》的批注`** callout 用于跨 Topic 在同一段原文上的额外批注（默认折叠）。
 
 注：按 Topic / 思维导图模式的输出仍走"mindmap 树状层级 + list"的紧凑风格，因为 mindmap 的层级密度高，weread 的"段落式 quote"撑不开。
