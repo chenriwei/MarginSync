@@ -236,6 +236,43 @@ def _strip_mn_buttons(text: str) -> str:
     return _BUTTON_RE.sub("", text)
 
 
+# 形如 `<pad>` `<form>` `<unk>` `<|endoftext|>` `<br/>` `</p>` 的"裸"标签：
+# 标签名由字母/数字/下划线/`|`/`-` 组成，且**没有属性**（即 `<` 后只有名字
+# 和可选 `/`）。带属性的（`<a href="...">`）不匹配，视为真 inline HTML。
+_BARE_TAG_RE = re.compile(r"<(/?)(\|?[A-Za-z][\w|\-]*\|?)\s*(/?)>")
+
+
+def _escape_pseudo_html(text: str) -> str:
+    """把裸标签（`<pad>` `<form>` `<|endoftext|>` 等）包成 inline code。
+
+    背景：MarginNote 笔记 / 教材里出现的 `<form>` `<br>` `<sub>` `<var>` 几乎
+    都是在**引用 HTML 标签字面量**（"使用 `<form>` 标签定义表单"），用户并
+    不期望它真的被渲染为 HTML 元素。
+
+    更要命的是：哪怕是真 HTML 标签名，只要不闭合、当 inline 文本用，就会
+    扰乱 Obsidian/markdown-it → 浏览器的渲染：`<form>` 会创建 form 元素并
+    把后面的兄弟节点都吃成自己的子树，导致紧跟的 `> quote` 蓝条 /
+    `> [!note]+` callout 装饰整段失效（裸文本）。同样的事情会发生在
+    `<pad>` `<unk>` `<|endoftext|>` 等 LLM token 上。
+
+    所以策略是：**所有"裸标签"形态（无属性）一律包成 inline code**，无论
+    名字是不是真的 HTML 标签。带属性的 `<a href="...">` `<img src=...>`
+    才视为真 inline HTML（极少见，正确写出来的话保留）。
+    """
+    if not text or "<" not in text:
+        return text
+
+    # 跳过反引号包裹的 inline code 段：split 后偶数索引是普通文本，奇数索引
+    # 是 code 段（保持原样），逐段替换避免破坏已经写好的 ``…``。
+    parts = text.split("`")
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        if "<" not in seg:
+            continue
+        parts[i] = _BARE_TAG_RE.sub(lambda m: f"`{m.group(0)}`", seg)
+    return "`".join(parts)
+
+
 def clean_text(text: str | None) -> str:
     if not text:
         return ""
@@ -245,6 +282,7 @@ def clean_text(text: str | None) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # 移除零宽字符
     text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = _escape_pseudo_html(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     # 注意：marginnote:// 卡片关联链接不在这里包装。它们在批注里通常是
     # MarginNote 4 "卡片关联跳转"功能写入的，希望被 _split_card_links 单独剥出
@@ -2279,8 +2317,12 @@ def export_book(
                 if n["ZNOTEID"] in image_cache:
                     stats.image_count += 1
 
-    # 10. # 读书笔记 段（仅当有评论时才输出）
-    review_body = _render_review_section(reviews, book_options, note_dates=note_dates)
+    # 10. 历史曾经渲染过 `# 读书笔记 / ### 划线评论` 段——把所有有批注的笔记
+    #     再单独罗列一份。但它跟 `# 高亮划线` 区里 `[!note]+ 💭 我的批注`
+    #     callout 显示的是同一条信息，纯粹的视觉重复。已下线，只在 frontmatter
+    #     `reviewCount` 字段里保留批注计数供索引/搜索。reviews 仍在收集，留作
+    #     未来如果想做"按章节 dataview 聚合"等高级视图的 hook。
+    _ = note_dates  # noqa: F841 (保留供未来 dataview 视图使用)
 
     # 11. frontmatter（对齐 weread-plugin 字段命名风格）
     # `lastNoteUpdate` 取本书所有笔记的最大 ZNOTE_DATE / ZHIGHLIGHT_DATE 作为
@@ -2356,13 +2398,6 @@ def export_book(
         body_lines.append("# 其它 Topic 的补充笔记")
         body_lines.append("")
         body_lines.extend(standalone_body)
-    if review_body:
-        if body_lines:
-            body_lines.append("")
-        body_lines.append("# 读书笔记")
-        body_lines.append("")
-        body_lines.extend(review_body)
-
     final = frontmatter + "\n" + "\n".join(head_block + body_lines).rstrip() + "\n"
     changed = _write_if_changed(file_path, final)
 

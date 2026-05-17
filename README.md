@@ -55,7 +55,7 @@ bookMd5: "..."
 title: "..."
 author: "..."
 noteCount: 19
-reviewCount: 3
+reviewCount: 3   # 仅作 frontmatter 计数，不再单独渲染章节
 imageCount: 0
 sourceTopics: [...]
 primaryTopic: "..."
@@ -79,28 +79,18 @@ source: "MarginNote 4"
 
 ## 章节标题  [p.X](url)
 
->  原文摘录文本  ^abc123def456  [p.1](marginnote4app://note/<ZNOTEID>)
+>  原文摘录文本  [p.1](marginnote4app://note/<ZNOTEID>)
 
->  下一段摘录  ^xyz789...  [p.2](url)
+>  下一段摘录  [p.2](url)
 
 > [!note]+ 💭 我的批注
 > 我写的批注内容
-
-# 读书笔记
-
-## 章节标题
-### 划线评论
-> 📌 原文摘录  ^abc123def456
-    - 💭 我的批注
-    - ⏱ 2024-04-01 17:14:08
-    - 📄 [p.1](marginnote4app://note/<ZNOTEID>)
 ```
 
 要点：
 
-- **`# 高亮划线`** 主体：每条原文是独立的 quote 段落 `>  text  ^block-id  [p.X](url)`。`^block-id` 是 Obsidian 的块引用 ID（取 `ZNOTEID` 前 12 位），其他笔记可以用 `[[书名#^block-id]]` 直接引用。
-- **`# 读书笔记`** 段：把所有"用户写了批注"的笔记按章节单列一份，附 `^block-id` 块引用 + `⏱ 时间` + `📄 跳回 MarginNote`。如果整本书都没批注，这段就不输出。
-- **`> [!note]+ 💭 我的批注`** callout 出现在原文紧跟着的位置，方便就地阅读；同时也会在末尾 `# 读书笔记` 段汇总，便于快速浏览所有评论。
+- **`# 高亮划线`** 主体：每条原文是独立的 quote 段落 `>  text  [p.X](url)`，紧跟其后的 `[!note]+ 💭 我的批注` callout 就地展示该笔记的批注内容，方便上下文阅读。
+- 历史曾有 `# 读书笔记 / ### 划线评论` 段把有批注的笔记再单列一份，但跟上方 callout 完全重复，已下线。`reviewCount` 字段仍保留作 frontmatter 索引。如果想做"全 vault 批注汇总"，用 Obsidian Dataview / Backlinks 即可。
 - **`> [!quote]- 💬 来自《X》的批注`** callout 用于跨 Topic 在同一段原文上的额外批注（默认折叠）。
 
 注：按 Topic / 思维导图模式的输出仍走"mindmap 树状层级 + list"的紧凑风格，因为 mindmap 的层级密度高，weread 的"段落式 quote"撑不开。
