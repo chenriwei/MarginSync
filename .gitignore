@@ -1,2 +1,10 @@
 MarginNote_Exports/
 __pycache__/
+.DS_Store
+*.pyc
+
+# Obsidian plugin build artifacts（构建产物，仓库不存，靠 GitHub Release 分发）
+obsidian-plugin/node_modules/
+obsidian-plugin/main.js
+obsidian-plugin/scripts/.smoke/
+

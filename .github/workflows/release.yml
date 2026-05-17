@@ -1,0 +1,47 @@
+name: Release Obsidian plugin
+
+# 触发：push 一个形如 v0.1.0 / 0.1.0 的 tag → 自动 build → 在 GitHub Release 里附上
+# main.js / manifest.json / styles.css，方便用户/BRAT 直接下载。
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: obsidian-plugin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "Automated release from CI." \
+            main.js manifest.json styles.css

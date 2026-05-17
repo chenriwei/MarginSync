@@ -3,6 +3,17 @@
 把 MarginNote 3 / 4 本地数据库里的笔记本（书籍 + 思维导图）同步到 Obsidian。
 输出风格参考 [obsidian-weread-plugin](https://github.com/zhaohongxuan/obsidian-weread-plugin)，让 MarginNote 笔记可以无缝融入 Obsidian 知识库。
 
+License: [MIT](LICENSE)
+
+## 两种用法
+
+| 入口 | 适合场景 | 链接 |
+| --- | --- | --- |
+| **Python CLI**（功能最全） | 需要按"书"聚合、文件夹分组、图片提取、子思维导图递归等高级能力，或在 CI 中无人值守跑 | 见下方"快速开始" |
+| **Obsidian 插件**（v0.1.0 内测） | 在 Obsidian 内点一下命令面板就同步，零依赖、不需要装 Python | [`obsidian-plugin/`](obsidian-plugin/README.md) |
+
+两者数据库读取规则、Markdown 渲染规则共享同一份"事实标准"，所以混用同步同一个 vault 也不会冲突。
+
 ## 快速开始
 
 ```bash

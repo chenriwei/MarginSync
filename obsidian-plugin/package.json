@@ -1,0 +1,35 @@
+{
+  "name": "marginsync-obsidian-plugin",
+  "version": "0.1.0",
+  "description": "Sync MarginNote 3/4 notes into your Obsidian vault.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "lint": "eslint src --ext .ts"
+  },
+  "keywords": [
+    "obsidian",
+    "marginnote",
+    "highlights",
+    "sync",
+    "pdf"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.1",
+    "eslint": "^8.56.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "bplist-parser": "^0.3.2"
+  }
+}
