@@ -66,6 +66,66 @@ function collectCardLabels(notes: Note[]): Map<string, string> {
   return map;
 }
 
+/**
+ * 把图片字节增量写入 ``<outRoot>/assets/<noteId>.<ext>``，返回 ``noteId → 相对当前 .md 的路径``。
+ *
+ * 命名约定与 Python 端 ``mn_export_tool.py`` 一致：用 noteId 作为文件名，下次同步时
+ * 同名覆盖，配合 ``writeIfChanged`` 保留 mtime。markdown 里使用相对路径
+ * ``../assets/<id>.png``，Obsidian 在 reader 模式能直接渲染。
+ */
+async function writeImageAssets(
+  vault: Vault,
+  outRoot: string,
+  imageBytes: Map<string, Buffer>,
+  generatedAttachments: Set<string>
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (imageBytes.size === 0) return out;
+  const assetsDir = `${outRoot}/assets`;
+
+  const adapter = vault.adapter;
+  if (!(await adapter.exists(assetsDir))) {
+    await vault.createFolder(assetsDir);
+  }
+  for (const [noteId, data] of imageBytes) {
+    const ext = sniffImageExtension(data);
+    const filename = `${noteId}.${ext}`;
+    const absPath = `${assetsDir}/${filename}`;
+    generatedAttachments.add(absPath);
+    // Obsidian 的 adapter.writeBinary 增量比对：先读已有 binary，相等就不写
+    let needWrite = true;
+    if (await adapter.exists(absPath)) {
+      try {
+        const old = await adapter.readBinary(absPath);
+        if (old.byteLength === data.byteLength && Buffer.from(old).equals(data)) {
+          needWrite = false;
+        }
+      } catch {
+        /* 读失败就重写 */
+      }
+    }
+    if (needWrite) {
+      // Obsidian writeBinary 需要 ArrayBuffer；Node Buffer 必须显式 slice 出独立的 ArrayBuffer
+      const ab = data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength
+      ) as ArrayBuffer;
+      await adapter.writeBinary(absPath, ab);
+    }
+    out.set(noteId, `../assets/${filename}`);
+  }
+  return out;
+}
+
+function sniffImageExtension(buf: Buffer): "png" | "jpg" | "gif" | "webp" {
+  if (buf.length < 4) return "png";
+  if (buf[0] === 0x89 && buf[1] === 0x50) return "png";
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
+  if (buf.toString("ascii", 0, 4) === "GIF8") return "gif";
+  if (buf.toString("ascii", 0, 4) === "RIFF") return "webp";
+  return "png";
+}
+
 /** 增量写入：内容不变则不写盘，保留原 mtime。 */
 async function writeIfChanged(vault: Vault, path: string, content: string): Promise<boolean> {
   const adapter = vault.adapter;
@@ -87,28 +147,34 @@ async function writeIfChanged(vault: Vault, path: string, content: string): Prom
   return true;
 }
 
-/** 列出 outputDir 下所有 .md 文件路径（vault 相对）。 */
-async function listExistingMd(vault: Vault, outputDir: string): Promise<string[]> {
+/** 列出 outputDir 下所有受插件管理的文件路径（vault 相对）。
+ *  受管文件 = 一切 ``.md``，加 ``assets/`` 子目录里的所有图片。其余文件（用户手动放的）一律不动。 */
+async function listExistingManaged(vault: Vault, outputDir: string): Promise<string[]> {
   const results: string[] = [];
   const root = vault.getAbstractFileByPath(outputDir);
   if (!(root instanceof TFolder)) return results;
   const walk = (folder: TFolder) => {
     for (const child of folder.children) {
-      if (child instanceof TFolder) walk(child);
-      else if (child instanceof TFile && child.extension === "md") results.push(child.path);
+      if (child instanceof TFolder) {
+        walk(child);
+      } else if (child instanceof TFile) {
+        const isMd = child.extension === "md";
+        const inAssets = child.path.includes(`${outputDir}/assets/`);
+        if (isMd || inAssets) results.push(child.path);
+      }
     }
   };
   walk(root);
   return results;
 }
 
-/** 清理本次未生成的孤儿 .md，并 rmdir 变空的子目录。 */
+/** 清理本次未生成的孤儿（.md / assets/ 图片），并 rmdir 变空的子目录。 */
 async function pruneOrphans(
   vault: Vault,
   outputDir: string,
   kept: Set<string>
 ): Promise<number> {
-  const existing = await listExistingMd(vault, outputDir);
+  const existing = await listExistingManaged(vault, outputDir);
   let removed = 0;
   for (const p of existing) {
     if (kept.has(p)) continue;
@@ -170,6 +236,8 @@ export async function syncMarginNote(
 
     const outRoot = normalizePath(settings.outputDir || "MarginSync");
     const generatedPaths = new Set<string>();
+    /** 本次同步写到 vault 的图片绝对路径（vault 相对），用于孤儿清理时跳过。 */
+    const generatedAttachments = new Set<string>();
     const generatedFilenamesPerDir = new Map<string, Set<string>>();
 
     for (const topic of topics) {
@@ -181,12 +249,24 @@ export async function syncMarginNote(
       if (!notes.length) continue;
 
       const stats: RenderStats = { noteCount: 0, imageCount: 0, skippedAi: 0, skippedEmpty: 0 };
+
+      // 抓本书图片字节并落到 vault assets/，得到 noteId → 相对当前 .md 的路径
+      // markdown 里 ../assets/<id>.png 即可在 Obsidian 内嵌
+      const imageBytes = db.fetchMedia(notes);
+      const imagePaths = await writeImageAssets(
+        app.vault,
+        outRoot,
+        imageBytes,
+        generatedAttachments
+      );
+
       const ctx: RenderContext = {
         urlScheme: appVer.urlScheme,
         appName: appVer.appName,
         imageWidth: settings.imageWidth,
         excerptNorms: collectExcerptNorms(notes),
         cardLabels: collectCardLabels(notes),
+        imagePaths,
       };
 
       // 对 notes 按 (page, startpos, noteid) 排序，保证跨进程稳定
@@ -274,7 +354,8 @@ export async function syncMarginNote(
     }
 
     if (settings.pruneOrphans) {
-      result.prunedOrphans = await pruneOrphans(app.vault, outRoot, generatedPaths);
+      const kept = new Set<string>([...generatedPaths, ...generatedAttachments]);
+      result.prunedOrphans = await pruneOrphans(app.vault, outRoot, kept);
     }
   } finally {
     db.close();

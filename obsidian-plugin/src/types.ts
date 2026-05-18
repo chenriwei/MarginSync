@@ -60,6 +60,11 @@ export interface RenderContext {
   excerptNorms: Set<string>;
   /** 卡片关联 label：ZNOTEID → 友好显示文本。 */
   cardLabels: Map<string, string>;
+  /**
+   * ``ZNOTEID → markdown 中嵌入的图片相对路径``。文件已经写到 vault attachments 中，
+   * 这里给的就是相对当前 .md 文件的路径，可以直接拼到 ``![](path)`` 里。
+   */
+  imagePaths?: Map<string, string>;
 }
 
 /** 一个节点经渲染抽出的"单条记录"，用于 weread 风格段落输出。 */

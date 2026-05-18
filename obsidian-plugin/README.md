@@ -17,7 +17,7 @@
 
 ## 安装
 
-> v0.1.0 还在内测中，没上 Obsidian Community Plugin 商店。请用以下任一方式手动安装：
+> 还在内测中，没上 Obsidian Community Plugin 商店。请用以下任一方式手动安装：
 
 ### 方式 A：从源码 build
 
@@ -88,7 +88,7 @@ source: "MarginNote 4"
 > 我认为答案的关键在于一个词：认知成本…  [p.3](marginnote4app://note/01839DE3-...)
 ```
 
-## v0.1 现在能做什么 / 还不能做什么
+## 现在能做什么 / 还不能做什么
 
 | 能力 | 状态 |
 | --- | --- |
@@ -99,10 +99,10 @@ source: "MarginNote 4"
 | 伪 HTML 转义（`<pad>`/`<form>` 等） | ✅ |
 | hashtag → frontmatter | ✅ |
 | 卡片关联跳转链接 | ✅ |
-| 增量写入 + 孤儿清理 | ✅ |
-| **图片提取**（NSKeyedArchiver plist 解码） | ⏳ v0.2 |
-| **`--by-book` 跨 Topic 聚合**（同一本书在多个 Topic 里的笔记合并） | ⏳ v0.2 |
-| **MarginNote 文件夹分组** | ⏳ v0.2 |
+| 增量写入 + 孤儿清理（含 `assets/` 图片） | ✅ |
+| **图片提取**（NSKeyedArchiver plist + MN4 sidecar 文件） | ✅ v0.2.0 |
+| **`--by-book` 跨 Topic 聚合**（同一本书在多个 Topic 里的笔记合并） | ⏳ v0.3 |
+| **MarginNote 文件夹分组** | ⏳ v0.3 |
 | 子思维导图递归 | ⏳ v0.3 |
 
 如果上面这些"还不能做什么"对你重要，可以暂时用根目录的 [`mn_export_tool.py`](../mn_export_tool.py) Python 脚本，它已经覆盖了全部能力。两边规则一致、可以混用。
@@ -111,9 +111,9 @@ source: "MarginNote 4"
 
 欢迎 issue / PR。需求集中在：
 
-1. **图片解码**：MarginNote 4 的 `ZHIGHLIGHT_PIC` 是 binary plist + NSKeyedArchiver，需要纯 JS 解出 hash 然后从 `ZMEDIA.ZDATA` 取出 PNG 写入 vault attachments
-2. **`by-book` 模式**：把同一本书在多个 Topic 里的笔记按 ZBOOKMD5 聚合，并保留主 Topic 的 mindmap 层级
-3. **更细的 AI 节点判定**：现在只识别 emoji 前缀，需要看 `ZTYPE` / `ZHIGHLIGHT_STYLE` 等字段做更精确的过滤
+1. **`by-book` 模式**：把同一本书在多个 Topic 里的笔记按 ZBOOKMD5 聚合，并保留主 Topic 的 mindmap 层级
+2. **更细的 AI 节点判定**：现在只识别 emoji 前缀，需要看 `ZTYPE` / `ZHIGHLIGHT_STYLE` 等字段做更精确的过滤
+3. **MarginNote 书架文件夹分组**：按 `ZBOOK.ZPATH` 把笔记本组织到子目录
 
 ## License
 

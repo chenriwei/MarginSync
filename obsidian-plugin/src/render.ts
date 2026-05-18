@@ -232,7 +232,9 @@ export function renderNoteWeread(
     comment = stripParagraphsInSet(comment, ctx.excerptNorms);
   }
 
-  const hasBody = !!(excerpt || comment || cardLinkIds.length);
+  const imagePath = ctx.imagePaths?.get(note.ZNOTEID) ?? null;
+
+  const hasBody = !!(excerpt || comment || cardLinkIds.length || imagePath);
   const headText = titleToShow;
 
   if (!headText && !hasBody) {
@@ -246,6 +248,7 @@ export function renderNoteWeread(
   // 决定 backlink 附在哪一段尾巴
   const slots: string[] = [];
   if (excerpt) slots.push("excerpt");
+  if (imagePath) slots.push("image");
   if (comment) slots.push("comment");
   if (cardLinkIds.length) slots.push("cardlinks");
   const last = slots.length ? slots[slots.length - 1] : null;
@@ -272,6 +275,13 @@ export function renderNoteWeread(
       lines.push(para);
     }
     lines.push("");
+  }
+
+  if (imagePath) {
+    const widthSpec = ctx.imageWidth > 0 ? `|${ctx.imageWidth}` : "";
+    lines.push(`![${widthSpec}](${imagePath})${trailing("image")}`);
+    lines.push("");
+    stats.imageCount += 1;
   }
 
   if (comment) {

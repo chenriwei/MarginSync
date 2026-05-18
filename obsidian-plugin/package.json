@@ -1,6 +1,6 @@
 {
   "name": "marginsync-obsidian-plugin",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Sync MarginNote 3/4 notes into your Obsidian vault.",
   "main": "main.js",
   "scripts": {
