@@ -1,7 +1,7 @@
 {
   "id": "marginsync",
   "name": "MarginSync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.4.0",
   "description": "Sync MarginNote 3/4 notes (highlights + comments + mindmaps) into your Obsidian vault, with weread-plugin style formatting and intelligent incremental updates.",
   "author": "chenriwei",

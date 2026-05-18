@@ -126,10 +126,34 @@ export function splitCardLinks(comment: string): { body: string; ids: string[] }
 // ---------- 去重 / 等价判断 ----------
 
 const collapseWs = (s: string) => s.replace(/\s+/g, "");
+const alphanumOnly = (s: string) => s.replace(/[^\p{L}\p{N}]+/gu, "");
 
 export function commentEqualsExcerpt(comment: string, excerpt: string): boolean {
   if (!comment || !excerpt) return false;
   return collapseWs(comment) === collapseWs(excerpt);
+}
+
+/**
+ * 决定 title 与 excerpt 重复时分别要不要保留，返回 [titleToShow, excerptToShow]。
+ *
+ * 规则按"保留信息量更多"的原则：
+ * - **完全相同**（单词卡场景：``title='extraordinarily', excerpt='extraordinarily'``）
+ *   → 保留 title（加粗单行更紧凑），丢 excerpt。
+ * - **title 是 excerpt 的严格子串**（如 ``title='重点', excerpt='...这是一段重点内容...'``）
+ *   → title 信息含量更少，丢 title 保 excerpt。
+ * - **excerpt 是 title 的严格子串**（罕见，比如 title 用户加了前缀/后缀注释）
+ *   → 保留 title，丢 excerpt。
+ * - 完全无关 → 两者都保留。
+ */
+export function resolveDedup(title: string, excerpt: string): [string, string] {
+  if (!title || !excerpt) return [title, excerpt];
+  const t = alphanumOnly(title);
+  const e = alphanumOnly(excerpt);
+  if (!t || !e) return [title, excerpt];
+  if (t === e) return [title, ""];
+  if (e.includes(t)) return ["", excerpt];
+  if (t.includes(e)) return [title, ""];
+  return [title, excerpt];
 }
 
 /**
@@ -195,13 +219,9 @@ export function renderNoteWeread(
   const { body: commentClean, ids: cardLinkIds } = splitCardLinks(comment);
   comment = commentClean;
 
-  // title 跟 excerpt 重复时不再单独渲染（避免双显示）
-  const titleNorm = collapseWs(title);
-  const excerptNorm = collapseWs(excerptRaw);
-  const isRedundant = !!(
-    title && excerptRaw && (titleNorm === excerptNorm || excerptNorm.startsWith(titleNorm))
-  );
-  const excerpt = excerptRaw && !isRedundant ? excerptRaw : "";
+  // title 与 excerpt 重复时按"信息量更多"原则各自决定保留/丢弃
+  // 见 resolveDedup 注释：单词卡（title==excerpt）保 title 丢 excerpt
+  const [titleToShow, excerpt] = resolveDedup(title, excerptRaw);
 
   // A. comment == excerpt 的伪批注 → 清空 comment
   if (comment && commentEqualsExcerpt(comment, excerpt)) {
@@ -213,7 +233,7 @@ export function renderNoteWeread(
   }
 
   const hasBody = !!(excerpt || comment || cardLinkIds.length);
-  const headText = title && !isRedundant ? title : "";
+  const headText = titleToShow;
 
   if (!headText && !hasBody) {
     stats.skippedEmpty += 1;

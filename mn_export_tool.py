@@ -633,8 +633,40 @@ class RenderStats:
     skipped_empty: int = 0
 
 
+def _resolve_dedup(title: str, excerpt: str) -> tuple[str, str]:
+    """决定标题与摘录重复时各自的保留/丢弃，返回 (title_to_show, excerpt_to_show)。
+
+    规则按"保留信息量更多"的原则：
+
+    - **完全相同**（单词卡场景：``title='extraordinarily', excerpt='extraordinarily'``）
+      → 保留 title（加粗单行更紧凑），丢 excerpt。
+    - **title 是 excerpt 的严格子串**（如 ``title='重点', excerpt='...这是一段重点内容...'``）
+      → title 信息含量更少，丢 title 保 excerpt。
+    - **excerpt 是 title 的严格子串**（罕见，比如 title 用户加了前缀/后缀注释）
+      → 保留 title，丢 excerpt。
+    - 完全无关 → 两者都保留。
+    """
+    if not (title and excerpt):
+        return (title, excerpt)
+
+    def normalize(s: str) -> str:
+        return "".join(c for c in s if c.isalnum())
+
+    t_norm = normalize(title)
+    e_norm = normalize(excerpt)
+    if not t_norm or not e_norm:
+        return (title, excerpt)
+    if t_norm == e_norm:
+        return (title, "")
+    if t_norm in e_norm:
+        return ("", excerpt)
+    if e_norm in t_norm:
+        return (title, "")
+    return (title, excerpt)
+
+
 def _is_redundant(title: str, excerpt: str) -> bool:
-    """标题与摘录如果信息重复，避免重复渲染。"""
+    """老版的"是否需要去重"二元判断。新代码请直接用 ``_resolve_dedup``，本函数仅留作向后兼容。"""
     if not (title and excerpt):
         return False
 
@@ -855,8 +887,7 @@ def render_node(
 
     image_data = _resolve_note_image(note, media_map, note_hash_map)
 
-    redundant = _is_redundant(title, excerpt)
-    excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    title_to_show, excerpt_to_show = _resolve_dedup(title, excerpt)
     has_body = (
         bool(excerpt_to_show) or bool(comment) or bool(image_data) or bool(card_link_ids)
     )
@@ -866,8 +897,8 @@ def render_node(
 
     has_children = bool(node.children)
     head_text: str | None = None
-    if title and not redundant:
-        head_text = title.strip()
+    if title_to_show:
+        head_text = title_to_show.strip()
     elif has_children and excerpt_to_show:
         # 这是真正的"分组父节点"——用户没写 title，而是用 PDF 划线本身作为
         # 章节/分组标题（如《背叛》里的"第一章"）。把摘录第一行抬作 head，
@@ -1841,8 +1872,7 @@ def _render_book_node_weread(
     page = note["ZSTARTPAGE"] or None
 
     image_data = _resolve_note_image(note, media_map, note_hash_map)
-    redundant = _is_redundant(title, excerpt)
-    excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    title_to_show, excerpt_to_show = _resolve_dedup(title, excerpt)
     # A. 跳过和本节点原文一字不差的"伪批注"：用户在 MarginNote 里把整段原文
     #    复制到批注框做"标记"动作，会让 `> 划线 quote` 和 `[!note]+ 💭 我的批注`
     #    callout 显示同一段文字。
@@ -1858,8 +1888,8 @@ def _render_book_node_weread(
 
     has_children = bool(node.children)
     head_text: str | None = None
-    if title and not redundant:
-        head_text = title.strip()
+    if title_to_show:
+        head_text = title_to_show.strip()
     elif has_children and excerpt_to_show:
         ex_lines = [l for l in excerpt_to_show.splitlines() if l.strip()]
         if ex_lines:
@@ -1970,8 +2000,7 @@ def _render_flat_book_note_weread(
     excerpt = clean_text(n["ZHIGHLIGHT_TEXT"])
     comment, _ = _split_tags_from_comment(clean_text(n["ZNOTES_TEXT"] or ""))
     comment, card_link_ids = _split_card_links(comment)
-    redundant = _is_redundant(title_text, excerpt)
-    excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    title_to_show, excerpt_to_show = _resolve_dedup(title_text, excerpt)
     # A. 跳过批注 == 原文 的冗余批注。
     if comment and _comment_equals_excerpt(comment, excerpt_to_show):
         comment = ""
@@ -1987,9 +2016,9 @@ def _render_flat_book_note_weread(
     if not (title_text or has_body):
         return
 
-    if title_text and not redundant:
+    if title_to_show:
         # 用户归纳的标题 → 加粗段落（不抢章节级 H 资源）
-        lines.append(f"**{escape_markdown_header(title_text)}**  {backlink}")
+        lines.append(f"**{escape_markdown_header(title_to_show)}**  {backlink}")
         lines.append("")
         if excerpt_to_show:
             _emit_quote_para(excerpt_to_show, lines)
@@ -2520,8 +2549,7 @@ def _render_flat_book_note(
     excerpt = clean_text(n["ZHIGHLIGHT_TEXT"])
     comment, _ = _split_tags_from_comment(clean_text(n["ZNOTES_TEXT"] or ""))
     comment, card_link_ids = _split_card_links(comment)
-    redundant = _is_redundant(title_text, excerpt)
-    excerpt_to_show = excerpt if (excerpt and not redundant) else ""
+    title_to_show, excerpt_to_show = _resolve_dedup(title_text, excerpt)
 
     backlink = _backlink(n["ZNOTEID"], page, options.url_scheme)
     image_data = image_cache.get(n["ZNOTEID"])
@@ -2529,8 +2557,8 @@ def _render_flat_book_note(
     bullet = "- "
     body_indent = "  "
 
-    if title_text and not redundant:
-        body.append(f"{bullet}**{escape_markdown_header(title_text)}**  {backlink}")
+    if title_to_show:
+        body.append(f"{bullet}**{escape_markdown_header(title_to_show)}**  {backlink}")
         if excerpt_to_show:
             _emit_excerpt(excerpt_to_show, body, body_indent)
         if image_data:
