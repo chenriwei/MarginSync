@@ -1613,12 +1613,20 @@ def _split_card_links(text: str) -> tuple[str, list[str]]:
 
 def _key_for_book_note(r: sqlite3.Row) -> tuple:
     """跨 topic 去重时的"同一段摘录"识别 key。
-    没定位信息的"组织/导航节点"用 ZNOTEID 唯一化。"""
+
+    MarginNote 4 把"mindmap 卡片节点"和"原始划线节点"分别存成两行 ZBOOKNOTE：
+    一行 ``ZNOTETITLE = 'aptly'`` 但 ``ZHIGHLIGHT_TEXT = ''``，另一行反过来；
+    两者 ``(ZSTARTPAGE, ZSTARTPOS)`` 完全相同。这里在抽 label 时让 title 兜底
+    excerpt，确保两条变体能映射到同一个 key、跨 topic 合并阶段能识别为"同一处划线"。
+
+    没定位信息的"组织/导航节点"退化到用 ZNOTEID 唯一化。"""
     excerpt_norm = _normalize_excerpt(r["ZHIGHLIGHT_TEXT"])
+    title_norm = _normalize_excerpt(r["ZNOTETITLE"]) if "ZNOTETITLE" in r.keys() else None
+    label_norm = excerpt_norm or title_norm
     pos = r["ZSTARTPOS"] or ""
     page = r["ZSTARTPAGE"] or 0
-    if excerpt_norm or pos:
-        return (page, pos, excerpt_norm)
+    if label_norm or pos:
+        return (page, pos, label_norm)
     return ("__solo__", r["ZNOTEID"])
 
 
@@ -2277,6 +2285,28 @@ def export_book(
     extra_per_node: dict[str, list[tuple[str, str]]] = {}
     standalone: list[tuple[str, sqlite3.Row]] = []
 
+    def _norm_comment(text: str | None) -> str:
+        return re.sub(r"\s+", "", clean_text(text).strip()) if text else ""
+
+    # 宽松 fallback：(page, excerpt_norm) → primary。strict key 多带 ``ZSTARTPOS``
+    # 坐标，但用户经常在不同 topic 里"重新划"同一段文字，坐标不同 → strict 匹
+    # 配失败 → 同一摘录被当作 standalone 重复列出。摘录文本本身已经足够独特，
+    # 这里允许同 page + 同摘录 fallback merge，多余的批注交给后续 _norm_comment
+    # 去重处理。
+    def _label_norm(n: sqlite3.Row) -> str | None:
+        return _normalize_excerpt(n["ZHIGHLIGHT_TEXT"]) or _normalize_excerpt(n["ZNOTETITLE"])
+
+    main_keys_loose: dict[tuple, sqlite3.Row] = {}
+    for tn in _walk_tree(roots):
+        n = tn.note
+        if n["ZBOOKMD5"] not in md5_set:
+            continue
+        label = _label_norm(n)
+        if not label:
+            continue
+        page = n["ZSTARTPAGE"] or 0
+        main_keys_loose.setdefault((page, label), n)
+
     for tid, ns in by_topic.items():
         if tid == main_tid:
             continue
@@ -2285,9 +2315,30 @@ def export_book(
         for r in ns:
             key = _key_for_book_note(r)
             primary = main_keys.get(key)
+            if primary is None:
+                label = _label_norm(r)
+                if label:
+                    primary = main_keys_loose.get((r["ZSTARTPAGE"] or 0, label))
             if primary is not None:
-                if r["ZNOTES_TEXT"]:
-                    extra_per_node.setdefault(primary["ZNOTEID"], []).append((ttitle, r["ZNOTES_TEXT"]))
+                if not r["ZNOTES_TEXT"]:
+                    continue
+                # MarginNote 允许同一条物理 note（ZNOTEID 相同）同时挂到多个
+                # topic 下（典型场景：mindmap topic + 普通书架 topic 共享同一条
+                # 划线）。此时 ZNOTES_TEXT 一模一样，再附一份"来自《X》的批注"
+                # callout 就是视觉冗余 → 直接跳过。
+                if r["ZNOTEID"] == primary["ZNOTEID"]:
+                    continue
+                # 防御：不同 ZNOTEID 但批注文本和 primary 完全相同（手工复制
+                # 划线的边角场景），也跳过。
+                if _norm_comment(r["ZNOTES_TEXT"]) == _norm_comment(primary["ZNOTES_TEXT"]):
+                    continue
+                # 同一条补充 note 在多个补充 topic 里出现 → 已经收过的批注
+                # 不再重复添加。
+                bucket = extra_per_node.setdefault(primary["ZNOTEID"], [])
+                norm = _norm_comment(r["ZNOTES_TEXT"])
+                if norm and any(_norm_comment(prev) == norm for _, prev in bucket):
+                    continue
+                bucket.append((ttitle, r["ZNOTES_TEXT"]))
             else:
                 # 只有 title、没摘录/批注/图/子树的纯占位节点不要列入 standalone。
                 # （PDF 目录大纲自动生成的章节占位、空的 mindmap 标题节点等。）
