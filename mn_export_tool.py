@@ -450,7 +450,19 @@ def fetch_notes(ctx: DBContext, topic_id: str) -> list[sqlite3.Row]:
 
 
 def fetch_media(ctx: DBContext, notes: list[sqlite3.Row]) -> tuple[dict[str, bytes], dict[str, str]]:
-    """根据笔记里的图片 hash 批量取 ZMEDIA 数据。"""
+    """根据笔记里的图片 hash 批量取出真实的图片字节。
+
+    存储策略（按 MarginNote 版本演进）：
+
+    1. **旧版 / 小图**：图片字节直接 inline 在 ``ZMEDIA.ZDATA`` blob 里（可能再被
+       NSKeyedArchiver 包了一层 bplist）。
+    2. **MarginNote 4 新版**：大图迁移到 sqlite 同目录的 sidecar 文件夹
+       ``<db>.sqlite.files/<hash>`` 中，``ZMEDIA`` 表里仍有该 ``ZMD5`` 行，
+       但 ``ZDATA`` 为 NULL。这种情况下需要去文件系统读取。
+
+    实现时两条路径并用：先批量查 sqlite，对没拿到字节的 hash 再 fallback 到
+    sidecar 目录。否则用户会看到大量"图片笔记被替换成 OCR 文本"的现象。
+    """
     media_map: dict[str, bytes] = {}
     note_hash_map: dict[str, str] = {}
     hashes: set[str] = set()
@@ -485,6 +497,29 @@ def fetch_media(ctx: DBContext, notes: list[sqlite3.Row]) -> tuple[dict[str, byt
                     data = None
                 if data:
                     media_map[row["ZMD5"]] = data
+
+    # Fallback：MN4 把大图外置到 sidecar 目录。把 inline 没找到的 hash 去
+    # 文件系统里再扫一遍。目录约定：<db_path>.files/<hash>
+    sidecar_dir = ctx.db_path + ".files"
+    if os.path.isdir(sidecar_dir):
+        for h in hashes:
+            if h in media_map:
+                continue
+            sidecar_path = os.path.join(sidecar_dir, h)
+            if not os.path.isfile(sidecar_path):
+                continue
+            try:
+                with open(sidecar_path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if not data:
+                continue
+            if data.startswith(b"bplist"):
+                data = unwrap_media_data(data)
+            if data and _looks_like_image(data):
+                media_map[h] = data
+
     return media_map, note_hash_map
 
 
