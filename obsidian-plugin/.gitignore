@@ -3,3 +3,5 @@ main.js
 *.log
 .DS_Store
 scripts/.smoke/
+src/native-embed.generated.ts
+prebuilds/

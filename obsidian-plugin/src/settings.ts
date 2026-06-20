@@ -1,8 +1,13 @@
+import * as fs from "fs";
 import { App, FileSystemAdapter, Notice, PluginSettingTab, Setting, normalizePath } from "obsidian";
 import type MarginSyncPlugin from "./main";
-import { MarginDb, expandHome } from "./db";
+import { MarginDb, normalizeDatabasePath } from "./db";
+import { resolvePluginDir } from "./sync";
 
 export type SyncScope = "all" | "books" | "mindmaps";
+
+/** 书籍类笔记的导出方式（与 Python CLI 的 --by-book / 默认 Topic 模式对应）。 */
+export type BookExportMode = "by-book" | "by-topic";
 
 /** 上次同步的摘要，渲染在设置页顶部的状态面板里。 */
 export interface LastSyncSummary {
@@ -22,6 +27,12 @@ export interface MarginSyncSettings {
   outputDir: string;
   /** 同步范围：全部 / 仅书籍 / 仅思维导图。 */
   scope: SyncScope;
+  /** 书籍导出：按书聚合（--by-book）或按 Topic。 */
+  bookExportMode: BookExportMode;
+  /** by-book 模式下按 MarginNote 书架文件夹（ZBOOK.ZPATH）分子目录。 */
+  folderGrouping: boolean;
+  /** 思维导图 Topic 导出时递归子思维导图（ZCHILDMAPNOTEID）。 */
+  recurseChildMindmaps: boolean;
   /** Obsidian 私有图片宽度语法 `![|N](path)` 的 N；0 为关闭，标准 markdown。 */
   imageWidth: number;
   /** 是否在同步结束时把上次生成、本次未再生成的 .md 视为孤儿清理掉。 */
@@ -36,6 +47,9 @@ export const DEFAULT_SETTINGS: MarginSyncSettings = {
   databasePath: "",
   outputDir: "MarginSync",
   scope: "all",
+  bookExportMode: "by-book",
+  folderGrouping: true,
+  recurseChildMindmaps: true,
   imageWidth: 0,
   pruneOrphans: true,
   keepAiNodes: false,
@@ -79,7 +93,7 @@ export class MarginSyncSettingTab extends PluginSettingTab {
           .setPlaceholder("/Users/you/Library/Containers/.../MarginNotes.sqlite")
           .setValue(this.plugin.settings.databasePath)
           .onChange(async (value) => {
-            this.plugin.settings.databasePath = value.trim();
+            this.plugin.settings.databasePath = normalizeDatabasePath(value);
             await this.plugin.saveSettings();
           })
       )
@@ -112,7 +126,7 @@ export class MarginSyncSettingTab extends PluginSettingTab {
     // ---- 输出目录 + 打开按钮 ----
     new Setting(containerEl)
       .setName("输出子目录")
-      .setDesc("vault 内放 MarginNote 笔记的相对路径，按 Topic 模式输出到 Books/ 或 MindMaps/。")
+      .setDesc("vault 内放 MarginNote 笔记的相对路径。by-book → Books/；思维导图 → MindMaps/。")
       .addText((text) =>
         text
           .setPlaceholder("MarginSync")
@@ -127,6 +141,44 @@ export class MarginSyncSettingTab extends PluginSettingTab {
           .setButtonText("打开")
           .setTooltip("在系统文件管理器中打开输出目录")
           .onClick(() => this.openOutputDir())
+      );
+
+    // ---- 书籍导出模式 ----
+    new Setting(containerEl)
+      .setName("书籍导出模式")
+      .setDesc(
+        "按书聚合：同一 PDF 跨 Topic 合并为一份 markdown（对齐 Python --by-book）。" +
+          "按 Topic：每个书籍笔记本单独一份文件。"
+      )
+      .addDropdown((dd) =>
+        dd
+          .addOption("by-book", "按书聚合（推荐）")
+          .addOption("by-topic", "按 Topic")
+          .setValue(this.plugin.settings.bookExportMode)
+          .onChange(async (value: string) => {
+            this.plugin.settings.bookExportMode = value as BookExportMode;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("书架文件夹分组")
+      .setDesc("按书聚合时，按 MarginNote「我的书架」目录（ZBOOK.ZPATH）在 Books/ 下建子文件夹。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.folderGrouping).onChange(async (value) => {
+          this.plugin.settings.folderGrouping = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("递归子思维导图")
+      .setDesc("导出思维导图 Topic 时，跟随 ZCHILDMAPNOTEID 递归导出嵌套子图（父 - 子 命名）。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.recurseChildMindmaps).onChange(async (value) => {
+          this.plugin.settings.recurseChildMindmaps = value;
+          await this.plugin.saveSettings();
+        })
       );
 
     // ---- 同步范围 ----
@@ -147,8 +199,8 @@ export class MarginSyncSettingTab extends PluginSettingTab {
 
     // ---- 图片宽度（v0.2 才生效） ----
     new Setting(containerEl)
-      .setName("图片宽度（v0.2 才生效）")
-      .setDesc("> 0 时输出 Obsidian 私有 ![|N](path) 限宽；0 为标准 markdown。图片解码计划在 v0.2 加入。")
+      .setName("图片宽度")
+      .setDesc("> 0 时输出 Obsidian 私有 ![|N](path) 限宽；0 为标准 markdown。")
       .addText((text) =>
         text
           .setValue(String(this.plugin.settings.imageWidth))
@@ -260,7 +312,7 @@ export class MarginSyncSettingTab extends PluginSettingTab {
         new Notice("无法获取文件绝对路径，请手动粘贴到输入框。");
         return;
       }
-      this.plugin.settings.databasePath = filePath;
+      this.plugin.settings.databasePath = normalizeDatabasePath(filePath);
       await this.plugin.saveSettings();
       this.display();
     });
@@ -270,13 +322,24 @@ export class MarginSyncSettingTab extends PluginSettingTab {
   }
 
   private async testConnection(): Promise<void> {
-    const path = expandHome(this.plugin.settings.databasePath);
+    const path = normalizeDatabasePath(this.plugin.settings.databasePath);
     if (!path) {
       new Notice("请先填写数据库路径。");
       return;
     }
+    if (!fs.existsSync(path)) {
+      new Notice(
+        `✗ 文件不存在：${path}\n请确认路径指向 MarginNotes.sqlite 文件本身（不是目录），且不要用引号包裹。`,
+        10000
+      );
+      return;
+    }
     try {
-      const db = new MarginDb(path);
+      const pluginDir = resolvePluginDir(
+        this.app,
+        this.plugin.manifest.dir ?? "marginsync"
+      );
+      const db = new MarginDb(path, pluginDir);
       const topics = db.listTopics();
       const books = topics.filter((t) => !t.ZMINDLINKS).length;
       const minds = topics.length - books;

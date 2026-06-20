@@ -25,22 +25,29 @@ export interface Note {
 export interface Topic {
   ZTOPICID: string;
   ZTITLE: string;
-  /**
-   * 在 ZTOPIC 表里实际是 `ZLOCALBOOKMD5`（单本书的 hash）。MarginNote 4 还有
-   * `ZBOOKLIST`（多本书空格分隔）但 v0.1 暂未使用。统一暴露成 `bookMd5`
-   * 字符串字段，避免和 ZBOOKNOTE 表里的 `ZBOOKMD5` 重名混淆。
-   */
   bookMd5: string | null;
   ZMINDLINKS: string | null;
+  ZBOOKLIST: string | null;
   ZDATE: number | null;
   ZLASTVISIT: number | null;
 }
 
-export interface Book {
+/** 按书聚合导出用的元信息。 */
+export interface BookMeta {
   md5: string;
+  md5List: string[];
   title: string;
   author: string | null;
   folder: string;
+  categories: string[];
+  noteCount: number;
+  fallback: boolean;
+}
+
+/** fetchNotesByMd5s 返回的行（含 Topic 关联字段）。 */
+export interface BookNoteRow extends Note {
+  topicTitle: string | null;
+  topicMindlinks: string | null;
 }
 
 /** 渲染期间的统计计数。 */

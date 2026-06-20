@@ -1,12 +1,14 @@
 {
   "name": "marginsync-obsidian-plugin",
-  "version": "0.2.0",
+  "version": "0.3.3",
   "description": "Sync MarginNote 3/4 notes into your Obsidian vault.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "lint": "eslint src --ext .ts"
+    "prebuild": "node scripts/generate-native-embed.mjs",
+    "build": "npm run prebuild && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "lint": "eslint src --ext .ts",
+    "rebuild:native": "bash scripts/rebuild-all-native.sh"
   },
   "keywords": [
     "obsidian",
@@ -17,6 +19,7 @@
   ],
   "license": "MIT",
   "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.11.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
@@ -29,7 +32,7 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
-    "better-sqlite3": "^11.5.0",
+    "better-sqlite3": "^12.11.1",
     "bplist-parser": "^0.3.2"
   }
 }

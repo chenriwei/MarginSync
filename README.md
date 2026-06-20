@@ -10,11 +10,19 @@ License: [MIT](LICENSE)
 | 入口 | 适合场景 | 链接 |
 | --- | --- | --- |
 | **Python CLI**（功能最全） | 需要按"书"聚合、文件夹分组、图片提取、子思维导图递归等高级能力，或在 CI 中无人值守跑 | 见下方"快速开始" |
-| **Obsidian 插件**（v0.1.0 内测） | 在 Obsidian 内点一下命令面板就同步，零依赖、不需要装 Python | [`obsidian-plugin/`](obsidian-plugin/README.md) |
+| **Obsidian 插件**（v0.3.0） | 在 Obsidian 内一键同步，支持 by-book / 文件夹分组 / 子思维导图 | [`obsidian-plugin/`](obsidian-plugin/README.md) · [安装说明](obsidian-plugin/README.md#安装) |
 
 两者数据库读取规则、Markdown 渲染规则共享同一份"事实标准"，所以混用同步同一个 vault 也不会冲突。
 
-## 快速开始
+### Obsidian 插件快速上手
+
+1. 从 [GitHub Releases](https://github.com/chenriwei/MarginSync/releases) 下载 `main.js` / `manifest.json` / `styles.css`，放到 vault 的 `.obsidian/plugins/marginsync/`
+2. 启用插件，在设置里填写 MarginNote 数据库路径（**先关闭 MarginNote**）
+3. 命令面板 → `MarginSync: 从 MarginNote 同步笔记`
+
+详细说明与平台限制见 [`obsidian-plugin/README.md`](obsidian-plugin/README.md)。
+
+## 快速开始（Python CLI）
 
 ```bash
 # 交互式选择要导出的笔记本（支持多选，用逗号分隔）

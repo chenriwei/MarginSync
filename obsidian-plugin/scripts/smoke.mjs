@@ -44,7 +44,7 @@ await build({
 const render = await import(renderOut);
 const dbMod = await import(dbOut);
 
-const db = new dbMod.MarginDb(dbPath);
+const db = new dbMod.MarginDb(dbPath, null);
 const topics = db.listTopics();
 console.log(`✓ 列出 Topic：${topics.length} 个`);
 

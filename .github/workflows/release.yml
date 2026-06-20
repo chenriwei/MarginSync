@@ -31,6 +31,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Sync manifest to repo root (for community directory HEAD check)
+        run: |
+          cp manifest.json ../manifest.json
+          cp versions.json ../versions.json
+
       - name: Resolve tag name
         id: tag
         shell: bash

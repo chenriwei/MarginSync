@@ -31,7 +31,11 @@ export default class MarginSyncPlugin extends Plugin {
   async runSync(): Promise<void> {
     const inProgress = new Notice("MarginSync: 同步中…", 0);
     try {
-      const result = await syncMarginNote(this.app, this.settings);
+      const result = await syncMarginNote(
+        this.app,
+        this.settings,
+        this.manifest.dir ?? "marginsync"
+      );
       inProgress.hide();
       this.settings.lastSync = {
         at: nowDisplayString(),

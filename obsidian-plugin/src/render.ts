@@ -190,7 +190,7 @@ export function backlink(noteId: string, page: number | null, urlScheme: string)
   return `[${label}](${url})`;
 }
 
-function escapeMdHeader(line: string): string {
+export function escapeMdHeader(line: string): string {
   // 行首 `#` + 空格 会被识别为标题 → 转义。
   return line.replace(/^(\s*)(#{1,6})(\s)/, "$1\\$2$3");
 }

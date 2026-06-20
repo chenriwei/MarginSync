@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: obsidian-plugin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: obsidian-plugin/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify root manifest matches plugin manifest
+        working-directory: .
+        run: |
+          diff manifest.json obsidian-plugin/manifest.json
+          diff versions.json obsidian-plugin/versions.json

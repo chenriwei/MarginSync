@@ -28,10 +28,7 @@ const ctx = await esbuild.context({
     "@lezer/common",
     "@lezer/highlight",
     "@lezer/lr",
-    // 本插件使用的本机依赖：必须以 require() 在运行时加载（Obsidian Electron），
-    // 不要被 esbuild 内联，否则 better-sqlite3 的 native bindings 找不到。
-    "better-sqlite3",
-    "bplist-parser",
+    // bplist-parser 纯 JS，打进 bundle；better-sqlite3 走 native-sqlite 嵌入加载。
     ...builtins,
   ],
   format: "cjs",

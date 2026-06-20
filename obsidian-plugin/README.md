@@ -1,119 +1,86 @@
 # MarginSync — Obsidian 插件
 
-把 MarginNote 3 / 4 的笔记（高亮划线、批注、思维导图层级、tag）同步到你的 Obsidian vault，
-样式对齐 [obsidian-weread-plugin](https://github.com/zhaohongxuan/obsidian-weread-plugin)，
-便于在同一个库里和微信读书笔记并排阅读。
+把 MarginNote 3 / 4 的笔记（高亮划线、批注、思维导图、tag）同步到你的 Obsidian vault。
+样式对齐 [obsidian-weread-plugin](https://github.com/zhaohongxuan/obsidian-weread-plugin)。
+
+**平台要求：** macOS 桌面端 Obsidian ≥ 1.12（`isDesktopOnly`）。预编译 SQLite 模块目前包含 **darwin-arm64**（Apple Silicon）；Intel Mac 请用源码 `npm install` 或 Python CLI。
 
 ## 主要特性
 
-- **直接读取本地 MarginNote SQLite 数据库**，无需打开 MarginNote / 不依赖任何在线服务
-- **weread-plugin 风格 Markdown 输出**：每条原文是独立 quote 段落，紧跟着的 `[!note]+ 💭 我的批注` callout 就地显示用户批注
-- **增量同步**：内容不变时不动文件 mtime，Obsidian 的"最近编辑"列表只在 MarginNote 那边真改了笔记时才会刷新
-- **孤儿清理**：MarginNote 端删除 / 改名 / 移目录的笔记会被同步删掉（可关）
-- **跨 note 去重**：批注内容跟某条独立划线一字不差时自动剥掉，原文优先
-- **伪 HTML 转义**：`<pad>` `<form>` `<|endoftext|>` 等"裸标签"自动包成 inline code，避免 Obsidian reader 模式被 HTMLUnknownElement 吞掉 quote/callout 装饰
-- **MarginNote 跳回链接** 写进 frontmatter 的 `marginnote` 字段，"笔记属性"面板里点一下就能跳回 App
-- **hashtag 自动收集到 frontmatter `tags`**
+- 直接读取本地 MarginNote SQLite，无需联网
+- weread 风格 Markdown（quote + `[!note]+ 💭 我的批注` callout）
+- 增量同步（内容不变保留 mtime）+ 孤儿清理
+- 图片提取（MN3 inline + MN4 sidecar）
+- 跨 note 批注去重、伪 HTML 转义、卡片关联、hashtag → frontmatter
 
 ## 安装
 
-> 还在内测中，没上 Obsidian Community Plugin 商店。请用以下任一方式手动安装：
+### 方式 A：GitHub Release（推荐）
 
-### 方式 A：从源码 build
+1. 打开 [Releases](https://github.com/chenriwei/MarginSync/releases)，下载最新版的 `main.js`、`manifest.json`、`styles.css`
+2. 放到 `<vault>/.obsidian/plugins/marginsync/`
+3. Obsidian → 设置 → 社区插件 → 启用 MarginSync
+
+首次同步会自动把预编译的 `better_sqlite3.node` 解压到插件目录，**无需**再跑 `npm install`。
+
+### 方式 B：BRAT
+
+用 [BRAT](https://github.com/TfTHacker/obsidian42-brat) 添加仓库 `chenriwei/MarginSync`，选择最新 release tag。
+
+### 方式 C：从源码 build
 
 ```bash
 cd obsidian-plugin
 npm install
 npm run build
-# 生成 main.js / manifest.json / styles.css 三个文件
 ```
-
-把 `obsidian-plugin/main.js`、`obsidian-plugin/manifest.json`、`obsidian-plugin/styles.css` 三个文件拷贝到你的 vault：
-
-```
-<your-vault>/.obsidian/plugins/marginsync/
-├── main.js
-├── manifest.json
-└── styles.css
-```
-
-然后 Obsidian 重启 / 在 Settings → Community plugins 里启用 "MarginSync"。
-
-### 方式 B：BRAT（社区第三方插件管理器）
-
-未上架商店期间，建议社区用户用 [BRAT](https://github.com/TfTHacker/obsidian42-brat) 添加这个仓库直接拉 release。
 
 ## 配置
 
-设置面板（Settings → Community plugins → MarginSync）需要填三件事：
+| 项 | 说明 |
+| --- | --- |
+| **MarginNote 数据库路径** | `MarginNotes.sqlite` 绝对路径；同步前**关闭 MarginNote** |
+| **输出子目录** | vault 内相对路径，默认 `MarginSync` |
+| **书籍导出模式** | **按书聚合**（`--by-book`，推荐）或按 Topic |
+| **书架文件夹分组** | 按书聚合时，按 MarginNote 书架目录建 `Books/` 子文件夹 |
+| **递归子思维导图** | 导出思维导图时跟随嵌套子图（`父 - 子` 文件名） |
+| **同步范围** | 全部 / 仅书籍 / 仅思维导图 |
 
-| 项 | 说明 | 示例 |
-| --- | --- | --- |
-| MarginNote 数据库路径 | `MarginNotes.sqlite` 的绝对路径，注意同步前要**关闭 MarginNote**，否则 sqlite 写入还在 WAL 里 | `/Users/you/Library/Containers/QReader.MarginStudyMac/Data/Library/MarginNote Extensions/marginnote.extension.cloudsync/MarginNotes.sqlite` |
-| 输出子目录 | vault 内放笔记的相对路径 | `MarginSync` |
-| 同步范围 | 全部 / 仅书籍 / 仅思维导图 | `all` |
+**MarginNote 4 常见路径（设置页可点击复制）：**
+
+```
+~/Library/Containers/QReader.MarginStudy.easy/Data/Library/Private Documents/MN4NotebookDatabase/0/MarginNotes.sqlite
+```
+
+**MarginNote 3：**
+
+```
+~/Library/Containers/QReader.MarginStudy.RealPro/Data/Library/MarginNote Extensions/marginnote.extension.notedatabase/MarginNotes_default_3.0.sqlite
+```
 
 ## 命令
 
-按 Cmd/Ctrl + P 打开命令面板，输入 `MarginSync` 即可看到：
+- 命令面板 → `MarginSync: 从 MarginNote 同步笔记`
+- 左侧 Ribbon「下载」图标
+- 设置页「开始同步」
 
-- **MarginSync: 从 MarginNote 同步笔记** — 跑一次完整同步
+## 功能对照（相对 Python CLI）
 
-也可以点左侧 ribbon 的"下载"图标快捷触发。
+| 能力 | 插件 v0.3 | Python CLI |
+| --- | --- | --- |
+| **`--by-book` 按书聚合** | ✅ | ✅ |
+| **书架文件夹分组** | ✅ | ✅ |
+| **子思维导图递归** | ✅ | ✅ |
+| **思维导图树状渲染** | ✅ | ✅ |
+| **图片 / 增量 / 孤儿清理** | ✅ | ✅ |
+| **书架分类 tags** | ✅ | ✅ |
 
-## 输出格式示例
+## 上架社区插件
 
-```markdown
----
-doc_type: "marginnote-export"
-topicId: "AE81868E-..."
-title: "AI 编程是一种'框架'"
-type: "book"
-noteCount: 7
-imageCount: 0
-tags:
-  - "编程/AI"
-marginnote: "marginnote4app://notebook/AE81868E-..."
-source: "MarginNote 4"
----
-# AI 编程是一种"框架"
+仓库根目录已包含 Obsidian 要求的 `manifest.json`、`versions.json`、`LICENSE`。
+提交流程见 [Obsidian 插件发布文档](https://docs.obsidian.md/Plugins/Releasing/Submit+your+plugin)。
 
-# 高亮划线
-
->  使用框架，控制权牢牢掌握在框架手中…  [p.2](marginnote4app://note/45078519-...)
-
->  要区分一个东西是框架还是库，关键在于找到"谁控制着程序的整体结构？"  [p.2](marginnote4app://note/169AC4F9-...)
-
-> [!note]+ 💭 我的批注
-> 我认为答案的关键在于一个词：认知成本…  [p.3](marginnote4app://note/01839DE3-...)
-```
-
-## 现在能做什么 / 还不能做什么
-
-| 能力 | 状态 |
-| --- | --- |
-| Topic 列表（books-only / mindmaps-only / all） | ✅ |
-| 单 Topic 内的笔记按页码排序展开 | ✅ |
-| 高亮划线 + 批注 callout（weread 风格） | ✅ |
-| 跨 note 批注去重 | ✅ |
-| 伪 HTML 转义（`<pad>`/`<form>` 等） | ✅ |
-| hashtag → frontmatter | ✅ |
-| 卡片关联跳转链接 | ✅ |
-| 增量写入 + 孤儿清理（含 `assets/` 图片） | ✅ |
-| **图片提取**（NSKeyedArchiver plist + MN4 sidecar 文件） | ✅ v0.2.0 |
-| **`--by-book` 跨 Topic 聚合**（同一本书在多个 Topic 里的笔记合并） | ⏳ v0.3 |
-| **MarginNote 文件夹分组** | ⏳ v0.3 |
-| 子思维导图递归 | ⏳ v0.3 |
-
-如果上面这些"还不能做什么"对你重要，可以暂时用根目录的 [`mn_export_tool.py`](../mn_export_tool.py) Python 脚本，它已经覆盖了全部能力。两边规则一致、可以混用。
-
-## 贡献
-
-欢迎 issue / PR。需求集中在：
-
-1. **`by-book` 模式**：把同一本书在多个 Topic 里的笔记按 ZBOOKMD5 聚合，并保留主 Topic 的 mindmap 层级
-2. **更细的 AI 节点判定**：现在只识别 emoji 前缀，需要看 `ZTYPE` / `ZHIGHLIGHT_STYLE` 等字段做更精确的过滤
-3. **MarginNote 书架文件夹分组**：按 `ZBOOK.ZPATH` 把笔记本组织到子目录
+维护者更新 Electron 预编译：`npm run rebuild:native`（需 macOS + Electron 39 ABI）。
 
 ## License
 
