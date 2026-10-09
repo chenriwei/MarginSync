@@ -23,7 +23,9 @@ import os
 import plistlib
 import re
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -76,7 +78,11 @@ def open_database() -> DBContext | None:
     for app_name, url_scheme, path in DB_CANDIDATES:
         if os.path.exists(path):
             try:
-                conn = sqlite3.connect(path)
+                # 只读 + immutable：本工具只读取数；immutable 让 SQLite 不依赖
+                # -shm/-wal（这两个文件在受限 shell / 未授权 TCC 场景下无法创建），
+                # 快照式读取即可，也避免误改 MarginNote 数据。
+                uri = f"file:{path}?mode=ro&immutable=1"
+                conn = sqlite3.connect(uri, uri=True)
                 conn.row_factory = sqlite3.Row
                 return DBContext(conn, app_name, url_scheme, path)
             except Exception as exc:  # noqa: BLE001
@@ -326,6 +332,17 @@ def ns_date_to_iso(ts: float | None) -> str | None:
     try:
         unix_ts = ts + NSDATE_EPOCH_OFFSET
         return datetime.datetime.fromtimestamp(unix_ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def ns_date_to_day(ts: float | None) -> str | None:
+    """与 weread frontmatter 的日期字段对齐：只取 YYYY-MM-DD。"""
+    if ts is None:
+        return None
+    try:
+        unix_ts = ts + NSDATE_EPOCH_OFFSET
+        return datetime.datetime.fromtimestamp(unix_ts).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -1246,17 +1263,36 @@ def export_notebook(
                 last_update_ts = ts
     last_update = ns_date_to_iso(last_update_ts) if last_update_ts is not None else None
 
+    weread_meta = _collect_weread_meta(
+        ctx,
+        book_md5_list,
+        [topic["ZTOPICID"]],
+        notes,
+        assets_dir,
+        "../assets",
+    )
+    review_count = sum(
+        1 for n in notes if clean_text(n["ZNOTES_TEXT"]).strip()
+    )
+
     frontmatter = render_frontmatter({
         "doc_type": "marginnote-export",
         "topicId": topic["ZTOPICID"],
-        "title": title,
         "type": "mindmap" if is_mindmap else "book",
-        "books": book_titles,
-        "authors": authors,
+        "bookId": weread_meta.get("bookId"),
+        "reviewCount": review_count,
         "noteCount": stats.note_count,
         "imageCount": stats.image_count,
+        "books": book_titles,
+        "authors": authors,
+        "cover": weread_meta.get("cover"),
+        "progress": weread_meta.get("progress"),
+        "readingDate": weread_meta.get("readingDate"),
+        "lastReadDate": weread_meta.get("lastReadDate"),
+        "readingStatus": weread_meta.get("readingStatus"),
         "created": created,
         "lastVisit": last_visit,
+        "title": title,
         "lastNoteUpdate": last_update,
         "tags": sorted(tags_set),
         "source": ctx.app_name,
@@ -1441,6 +1477,117 @@ def _parse_book_folder(zpath: str | None) -> str:
         sub = parts[1] if len(parts) > 1 else ""
         return sub.strip("/")
     return p.strip("/")
+
+
+# ---------------------------------------------------------------------------
+# Weread 对齐字段的数据源（书源文件 / 进度配置 / Topic 访问时间）
+# ---------------------------------------------------------------------------
+
+_MNDOC_ICLOUD_PREFIX = "$$$MNDOCLINK$$$iCloud.QReader.MarginStudy.easy"
+_ICLOUD_DOCS_DIR = os.path.expanduser(
+    "~/Library/Mobile Documents/iCloud~QReader~MarginStudy~easy/Documents"
+)
+
+
+def _resolve_book_source_path(
+    zpath: str | None, zbookurl: str | None, zfile: str | None = None
+) -> str | None:
+    """把 ZBOOK 行解析成本机书源文件的绝对路径。
+
+    iCloud 书的实际落盘位置约定为：
+      iCloud~QReader~MarginStudy~easy/Documents/<ZPATH 容器名之后的子目录>/<文件名>
+
+    文件名优先取 ZBOOKURL；为 NULL 时（常见）退回 ZFILE。非 iCloud 来源
+    （MN4Sample 等）暂不支持，返回 None。文件未被 iCloud 下载（仅是占位符）
+    时也返回 None。
+    """
+    if not zpath or not zpath.startswith(_MNDOC_ICLOUD_PREFIX):
+        return None
+    name = os.path.basename(zbookurl) if zbookurl else (zfile or None)
+    if not name:
+        return None
+    sub = zpath[len(_MNDOC_ICLOUD_PREFIX):].strip("/")
+    p = os.path.join(_ICLOUD_DOCS_DIR, sub, name)
+    return p if os.path.isfile(p) else None
+
+
+def _fetch_book_sources(
+    ctx: DBContext, md5_list: list[str]
+) -> dict[str, dict[str, str | None]]:
+    """查 ZBOOK 的源文件信息。
+
+    返回 ``{ZMD5 或 ZMD5LONG: {"md5": ZMD5, "zpath":..., "zbookurl":...,
+    "zfile":...}}``，短/长 MD5 都挂同一个值，方便调用方按任一字段反查。
+    """
+    if not md5_list:
+        return {}
+    cur = ctx.conn.cursor()
+    out: dict[str, dict[str, str | None]] = {}
+    for i in range(0, len(md5_list), 500):
+        batch = md5_list[i : i + 500]
+        ph = ",".join("?" * len(batch))
+        cur.execute(
+            f"SELECT ZMD5, ZMD5LONG, ZPATH, ZBOOKURL, ZFILE FROM ZBOOK "
+            f"WHERE ZMD5LONG IN ({ph}) OR ZMD5 IN ({ph})",
+            batch + batch,
+        )
+        for md5, md5long, zpath, zbookurl, zfile in cur.fetchall():
+            val = {
+                "md5": md5,
+                "zpath": zpath,
+                "zbookurl": zbookurl,
+                "zfile": zfile,
+            }
+            if md5:
+                out[md5] = val
+            if md5long:
+                out[md5long] = val
+    return out
+
+
+def _fetch_book_config_percents(
+    ctx: DBContext, md5_list: list[str]
+) -> dict[str, float | None]:
+    """读 ZBOOKCONFIG.ZCURRPAGEPERCENT（0~1 的阅读进度），短/长 MD5 都挂键。"""
+    if not md5_list:
+        return {}
+    cur = ctx.conn.cursor()
+    out: dict[str, float | None] = {}
+    for i in range(0, len(md5_list), 500):
+        batch = md5_list[i : i + 500]
+        ph = ",".join("?" * len(batch))
+        cur.execute(
+            f"SELECT ZMD5, ZMD5LONG, ZCURRPAGEPERCENT FROM ZBOOKCONFIG "
+            f"WHERE ZMD5LONG IN ({ph}) OR ZMD5 IN ({ph})",
+            batch + batch,
+        )
+        for md5, md5long, pct in cur.fetchall():
+            if md5:
+                out[md5] = pct
+            if md5long:
+                out[md5long] = pct
+    return out
+
+
+def _fetch_topic_lastvisits(
+    ctx: DBContext, topic_ids: Iterable[str]
+) -> dict[str, float | None]:
+    """读 ZTOPIC.ZLASTVISIT（最后打开时间，NSDate）。"""
+    ids = [t for t in dict.fromkeys(topic_ids) if t]
+    if not ids:
+        return {}
+    cur = ctx.conn.cursor()
+    out: dict[str, float | None] = {}
+    for i in range(0, len(ids), 500):
+        batch = ids[i : i + 500]
+        ph = ",".join("?" * len(batch))
+        cur.execute(
+            f"SELECT ZTOPICID, ZLASTVISIT FROM ZTOPIC WHERE ZTOPICID IN ({ph})",
+            batch,
+        )
+        for tid, visit in cur.fetchall():
+            out[tid] = visit
+    return out
 
 
 def list_books(ctx: DBContext) -> list[dict]:
@@ -2161,6 +2308,217 @@ def _render_review_section(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Cover extraction（与 weread 的 cover 字段对齐）
+# ---------------------------------------------------------------------------
+
+_COVER_SIZE = 600
+
+
+def _pdf_cover_bytes(src: str) -> bytes | None:
+    """用系统自带 qlmanage 把 PDF 首页渲染成 PNG（离线、无第三方依赖）。"""
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            subprocess.run(
+                ["/usr/bin/qlmanage", "-t", "-s", str(_COVER_SIZE), "-o", td, src],
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        out_path = os.path.join(td, os.path.basename(src) + ".png")
+        if not os.path.isfile(out_path):
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+
+
+def _epub_cover_bytes(src: str) -> bytes | None:
+    """从 EPUB 包内取出内嵌封面（container.xml → OPF → cover item）。"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    OPF_NS = "{http://www.idpf.org/2007/opf}"
+    try:
+        with zipfile.ZipFile(src) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = None
+            for rf in container.iter():
+                if rf.tag.endswith("}rootfile"):
+                    opf_path = rf.attrib.get("full-path")
+                    break
+            if not opf_path:
+                return None
+            opf_dir = os.path.dirname(opf_path)
+            opf = ET.fromstring(z.read(opf_path))
+
+            cover_id = None
+            items: list[tuple[str, str, str]] = []  # (id, href, media-type)
+            for el in opf.iter():
+                if el.tag == f"{OPF_NS}meta" and el.attrib.get("name") == "cover":
+                    cover_id = el.attrib.get("content")
+                if el.tag == f"{OPF_NS}item":
+                    items.append((
+                        el.attrib.get("id", ""),
+                        el.attrib.get("href", ""),
+                        el.attrib.get("media-type", ""),
+                    ))
+
+            href = None
+            if cover_id:
+                for iid, ihref, _ in items:
+                    if iid == cover_id:
+                        href = ihref
+                        break
+            if href is None:
+                # EPUB3：properties="cover-image"
+                for el in opf.iter():
+                    if (el.tag == f"{OPF_NS}item"
+                            and "cover-image" in el.attrib.get("properties", "")):
+                        href = el.attrib.get("href")
+                        break
+            if href is None:
+                # 兜底：manifest 里第一张图片
+                for _iid, ihref, mt in items:
+                    if mt.startswith("image/"):
+                        href = ihref
+                        break
+            if not href:
+                return None
+            cover_path = os.path.normpath(os.path.join(opf_dir, href))
+            return z.read(cover_path)
+    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+        return None
+
+
+def _cover_bytes(src: str) -> bytes | None:
+    low = src.lower()
+    if low.endswith(".pdf"):
+        return _pdf_cover_bytes(src)
+    if low.endswith(".epub"):
+        return _epub_cover_bytes(src)
+    return None
+
+
+def _image_ext(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] == b"GIF8":
+        return "gif"
+    if data[:4] == b"RIFF":
+        return "webp"
+    return "png"
+
+
+def _write_cover_asset(assets_dir: str, book_id: str, data: bytes) -> str:
+    """把封面写入 ``assets/cover-<bookId>.<ext>``（已存在同名则复用），返回文件名。"""
+    ext = _image_ext(data)
+    filename = f"cover-{book_id}.{ext}"
+    p = os.path.join(assets_dir, filename)
+    if not os.path.isfile(p):
+        with open(p, "wb") as f:
+            f.write(data)
+    return filename
+
+
+def _pick_book_source(
+    md5_list: list[str],
+    sources: dict[str, dict[str, str | None]],
+) -> tuple[str, str] | None:
+    """按 md5_list 顺序找第一个本机可用的书源文件，返回 (bookId, srcPath)。"""
+    for key in md5_list:
+        info = sources.get(key)
+        if not info:
+            continue
+        src = _resolve_book_source_path(
+            info.get("zpath"), info.get("zbookurl"), info.get("zfile")
+        )
+        if src:
+            return str(info.get("md5") or key), src
+    return None
+
+
+def _collect_weread_meta(
+    ctx: DBContext,
+    md5_list: list[str],
+    topic_ids: Iterable[str],
+    note_rows: Iterable[sqlite3.Row],
+    assets_dir: str,
+    image_dir_relative: str,
+) -> dict[str, Any]:
+    """汇总与 weread 对齐的字段：bookId / cover / progress / readingDate /
+    lastReadDate / readingStatus。拿不到的字段（readingTime、isbn）不生成。
+
+    字段口径：
+      - bookId：ZBOOK.ZMD5；书源不在本机时也保留。
+      - cover：PDF 首页 / EPUB 内嵌封面，渲染到 assets。
+      - progress：ZBOOKCONFIG 进度，多本书取最大；无记录为 ``"-1"``。
+      - readingDate：本书最早一条划线/笔记日期。
+      - lastReadDate：关联 Topic 最大 ZLASTVISIT，兜底最晚笔记日期。
+      - readingStatus：进度 ≥99% 为 ``"2"``（已读），否则 ``"1"``（在读）；
+        进度未知时省略——该状态在 weread 里是用户手动标记的，无法从 MN 精确推断。
+    """
+    sources = _fetch_book_sources(ctx, md5_list)
+    percents = _fetch_book_config_percents(ctx, md5_list)
+    visits = _fetch_topic_lastvisits(ctx, topic_ids)
+
+    earliest: float | None = None
+    latest: float | None = None
+    for r in note_rows:
+        for col in ("ZHIGHLIGHT_DATE", "ZNOTE_DATE"):
+            ts = r[col] if col in r.keys() else None
+            if ts is None:
+                continue
+            if earliest is None or ts < earliest:
+                earliest = ts
+            if latest is None or ts > latest:
+                latest = ts
+
+    meta: dict[str, Any] = {}
+
+    picked = _pick_book_source(md5_list, sources)
+    book_id: str | None = None
+    if picked is not None:
+        book_id, src = picked
+        try:
+            data = _cover_bytes(src)
+        except Exception:
+            data = None
+        if data:
+            name = _write_cover_asset(assets_dir, book_id, data)
+            meta["cover"] = f"{image_dir_relative}/{name}"
+    if book_id is None and md5_list:
+        info = sources.get(md5_list[0])
+        book_id = str((info or {}).get("md5") or md5_list[0])
+    if book_id:
+        meta["bookId"] = book_id
+
+    pct_vals = [
+        v for key in md5_list
+        if (v := percents.get(key)) is not None
+    ]
+    pct = max(pct_vals) if pct_vals else None
+    if pct is None:
+        meta["progress"] = "-1"
+    else:
+        meta["progress"] = f"{min(100, round(pct * 100))}%"
+        meta["readingStatus"] = "2" if pct >= 0.99 else "1"
+
+    reading_day = ns_date_to_day(earliest)
+    if reading_day:
+        meta["readingDate"] = reading_day
+
+    visit_vals = [v for v in visits.values() if v is not None]
+    last_read_ts = max(visit_vals) if visit_vals else latest
+    last_read_day = ns_date_to_day(last_read_ts)
+    if last_read_day:
+        meta["lastReadDate"] = last_read_day
+
+    return meta
+
+
 def export_book(
     ctx: DBContext,
     book_meta: dict,
@@ -2535,17 +2893,34 @@ def export_book(
     last_update = ns_date_to_iso(last_update_ts) if last_update_ts is not None else None
 
     is_merged = len(md5_list) > 1
+    weread_meta = _collect_weread_meta(
+        ctx, md5_list, by_topic.keys(), rows, assets_dir, image_rel
+    )
+
+    # 字段顺序对齐 weread 导出，便于并排对照 / 统一看板视图；MN 专有字段放最后。
     fm: dict[str, Any] = {
         "doc_type": "marginnote-highlights-reviews",
-        "bookMd5": md5_list if is_merged else md5_list[0],
+        "bookId": weread_meta.get("bookId"),
+        "reviewCount": len(reviews),
+        "noteCount": stats.note_count,
     }
-    if is_merged:
-        fm["mergedBooks"] = len(md5_list)
-    fm["title"] = title
     if author:
         fm["author"] = author
-    fm["noteCount"] = stats.note_count
-    fm["reviewCount"] = len(reviews)
+    if weread_meta.get("cover"):
+        fm["cover"] = weread_meta["cover"]
+    fm["progress"] = weread_meta.get("progress", "-1")
+    if weread_meta.get("readingDate"):
+        fm["readingDate"] = weread_meta["readingDate"]
+    if weread_meta.get("lastReadDate"):
+        fm["lastReadDate"] = weread_meta["lastReadDate"]
+    fm["title"] = title
+    if weread_meta.get("readingStatus"):
+        fm["readingStatus"] = weread_meta["readingStatus"]
+
+    # --- MN 专有字段 ---
+    fm["bookMd5"] = md5_list if is_merged else md5_list[0]
+    if is_merged:
+        fm["mergedBooks"] = len(md5_list)
     fm["imageCount"] = stats.image_count
     fm["sourceTopics"] = sorted(all_sources.keys())
     fm["primaryTopic"] = main_meta["title"]

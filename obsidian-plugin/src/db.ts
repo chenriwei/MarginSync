@@ -152,9 +152,16 @@ export function detectAppVersion(dbPath: string): AppVersion {
   return { appName: "MarginNote 4", urlScheme: "marginnote4app" };
 }
 
+/** ZBOOK 源文件定位信息（对应 weread cover 提取所需）。 */
+export interface BookSourceInfo {
+  md5: string;
+  zpath: string | null;
+  zbookurl: string | null;
+  zfile: string | null;
+}
+
 export class MarginDb {
   private db: Database.Database;
-
   /**
    * @param pluginDir Obsidian 插件目录绝对路径；传 null 时走 dev 模式（node_modules）。
    */
@@ -402,6 +409,84 @@ export class MarginDb {
         if (row.ZMD5LONG) out.set(row.ZMD5LONG, info);
         if (row.ZMD5) out.set(row.ZMD5, info);
       }
+    }
+    return out;
+  }
+
+  // ---------- weread 对齐字段的数据源 ----------
+
+  /** ZBOOK 源文件信息（封面提取用）。 */
+  fetchBookSources(md5List: string[]): Map<string, BookSourceInfo> {
+    const out = new Map<string, BookSourceInfo>();
+    if (!md5List.length) return out;
+    for (let i = 0; i < md5List.length; i += 500) {
+      const batch = md5List.slice(i, i + 500);
+      const ph = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT ZMD5, ZMD5LONG, ZPATH, ZBOOKURL, ZFILE FROM ZBOOK
+           WHERE ZMD5LONG IN (${ph}) OR ZMD5 IN (${ph})`
+        )
+        .all(...batch, ...batch) as {
+        ZMD5: string;
+        ZMD5LONG: string;
+        ZPATH: string | null;
+        ZBOOKURL: string | null;
+        ZFILE: string | null;
+      }[];
+      for (const r of rows) {
+        const info: BookSourceInfo = {
+          md5: r.ZMD5,
+          zpath: r.ZPATH,
+          zbookurl: r.ZBOOKURL,
+          zfile: r.ZFILE,
+        };
+        if (r.ZMD5) out.set(r.ZMD5, info);
+        if (r.ZMD5LONG) out.set(r.ZMD5LONG, info);
+      }
+    }
+    return out;
+  }
+
+  /** ZBOOKCONFIG 阅读进度（ZCURRPAGEPERCENT，0~1；可能为 null）。 */
+  fetchBookConfigs(md5List: string[]): Map<string, number | null> {
+    const out = new Map<string, number | null>();
+    if (!md5List.length) return out;
+    for (let i = 0; i < md5List.length; i += 500) {
+      const batch = md5List.slice(i, i + 500);
+      const ph = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT ZMD5, ZMD5LONG, ZCURRPAGEPERCENT FROM ZBOOKCONFIG
+           WHERE ZMD5LONG IN (${ph}) OR ZMD5 IN (${ph})`
+        )
+        .all(...batch, ...batch) as {
+        ZMD5: string;
+        ZMD5LONG: string;
+        ZCURRPAGEPERCENT: number | null;
+      }[];
+      for (const r of rows) {
+        if (r.ZMD5) out.set(r.ZMD5, r.ZCURRPAGEPERCENT);
+        if (r.ZMD5LONG) out.set(r.ZMD5LONG, r.ZCURRPAGEPERCENT);
+      }
+    }
+    return out;
+  }
+
+  /** ZTOPIC 最后访问时间（ZLASTVISIT，NSDate）。 */
+  fetchTopicVisits(topicIds: string[]): Map<string, number | null> {
+    const out = new Map<string, number | null>();
+    const ids = [...new Set(topicIds)].filter(Boolean);
+    if (!ids.length) return out;
+    for (let i = 0; i < ids.length; i += 500) {
+      const batch = ids.slice(i, i + 500);
+      const ph = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT ZTOPICID, ZLASTVISIT FROM ZTOPIC WHERE ZTOPICID IN (${ph})`
+        )
+        .all(...batch) as { ZTOPICID: string; ZLASTVISIT: number | null }[];
+      for (const r of rows) out.set(r.ZTOPICID, r.ZLASTVISIT);
     }
     return out;
   }

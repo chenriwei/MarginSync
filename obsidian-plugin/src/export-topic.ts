@@ -2,11 +2,13 @@
  * 按 Topic 导出（思维导图树状渲染 + 子思维导图递归）。
  */
 
-import type { MarginDb, AppVersion } from "./db";
+import type { MarginDb, AppVersion, BookSourceInfo } from "./db";
+import { extractCover, resolveBookSourcePath } from "./cover";
 import {
   cleanText,
   extractHashtags,
   isKept,
+  nsDateToDate,
   nsDateToIso,
   renderFrontmatter,
   renderNoteWeread,
@@ -167,6 +169,52 @@ async function exportOneTopic(
   const bookTitles = [...bookInfos.values()].map((b) => b.title).filter(Boolean);
   const authors = [...new Set([...bookInfos.values()].map((b) => b.author).filter(Boolean))] as string[];
 
+  // ---- weread 对齐字段（源文件 / 封面 / 进度 / 访问时间）----
+  const sourceInfos = db.fetchBookSources(bookMd5List);
+  const bookConfigs = db.fetchBookConfigs(bookMd5List);
+
+  let coverRel: string | null = null;
+  let bookId: string | null = null;
+  for (const key of bookMd5List) {
+    const info: BookSourceInfo | undefined = sourceInfos.get(key);
+    if (!info) continue;
+    bookId = info.md5 || key;
+    if (!resolveBookSourcePath(info)) continue;
+    const coverData = await extractCover(info);
+    if (coverData) {
+      // md 位于 Books|MindMaps/<name>.md，assets 是同级目录，用默认 ../assets。
+      const coverKey = `cover-${bookId}`;
+      const coverPaths = await writeImageAssets(
+        state.vault,
+        state.outRoot,
+        new Map([[coverKey, coverData]]),
+        state.generatedAttachments
+      );
+      coverRel = coverPaths.get(coverKey) ?? null;
+      break;
+    }
+  }
+  if (!bookId) bookId = bookMd5List[0] ?? null;
+
+  let progressPct: number | null = null;
+  for (const key of bookMd5List) {
+    const v = bookConfigs.get(key);
+    if (v != null && (progressPct == null || v > progressPct)) progressPct = v;
+  }
+
+  const topicVisits = db.fetchTopicVisits([topic.ZTOPICID]);
+  const lastVisitTs = topicVisits.get(topic.ZTOPICID) ?? null;
+
+  let earliestTs: number | null = null;
+  let latestTs: number | null = null;
+  for (const n of notes) {
+    for (const ts of [n.ZNOTE_DATE, n.ZHIGHLIGHT_DATE]) {
+      if (ts == null) continue;
+      if (earliestTs == null || ts < earliestTs) earliestTs = ts;
+      if (latestTs == null || ts > latestTs) latestTs = ts;
+    }
+  }
+
   let lastUpdateTs: number | null = null;
   for (const n of notes) {
     for (const ts of [n.ZNOTE_DATE, n.ZHIGHLIGHT_DATE]) {
@@ -190,17 +238,29 @@ async function exportOneTopic(
       ].filter((l) => l !== "")
     : [`# ${title}`, "", "# 高亮划线", ""];
 
+  const reviewCount = notes.filter((n) => cleanText(n.ZNOTES_TEXT).trim()).length;
+  const lastReadDate = nsDateToDate(lastVisitTs ?? latestTs);
+  const readingStatus =
+    progressPct == null ? undefined : progressPct >= 0.99 ? "2" : "1";
+
   const fm = renderFrontmatter({
     doc_type: "marginnote-export",
     topicId: topic.ZTOPICID,
-    title,
     type: isMindmap ? "mindmap" : "book",
-    books: bookTitles.length ? bookTitles : undefined,
-    authors: authors.length ? authors : undefined,
+    bookId,
+    reviewCount,
     noteCount: stats.noteCount,
     imageCount: stats.imageCount,
+    books: bookTitles.length ? bookTitles : undefined,
+    authors: authors.length ? authors : undefined,
+    cover: coverRel ?? undefined,
+    progress: progressPct == null ? undefined : `${Math.min(100, Math.round(progressPct * 100))}%`,
+    readingDate: nsDateToDate(earliestTs),
+    lastReadDate: lastReadDate ?? undefined,
+    readingStatus,
     created: nsDateToIso(topic.ZDATE),
     lastVisit: nsDateToIso(topic.ZLASTVISIT),
+    title,
     lastNoteUpdate: nsDateToIso(lastUpdateTs),
     tags: collectTags(db, notes, bookMd5List),
     marginnote: `${appVer.urlScheme}://notebook/${topic.ZTOPICID}`,

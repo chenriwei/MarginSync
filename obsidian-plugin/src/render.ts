@@ -356,6 +356,16 @@ export function nsDateToIso(ts: number | null): string | null {
   );
 }
 
+/** 与 weread 的日期字段对齐：只取 YYYY-MM-DD。 */
+export function nsDateToDate(ts: number | null): string | null {
+  if (ts == null) return null;
+  const epoch = 978307200; // 2001-01-01 UTC
+  const d = new Date((epoch + ts) * 1000);
+  if (isNaN(d.getTime())) return null;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 /** 把字符串变成安全的文件名（去掉 / : * ? " < > | 等）。 */
 export function sanitizeFilename(name: string): string {
   return name

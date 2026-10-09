@@ -3,7 +3,8 @@
  */
 
 import { Vault } from "obsidian";
-import type { MarginDb, AppVersion } from "./db";
+import type { MarginDb, AppVersion, BookSourceInfo } from "./db";
+import { extractCover, resolveBookSourcePath } from "./cover";
 import {
   emitExtrasPara,
   hasRealContent,
@@ -15,6 +16,7 @@ import {
   cleanText,
   extractHashtags,
   isKept,
+  nsDateToDate,
   nsDateToIso,
   renderFrontmatter,
   renderNoteWeread,
@@ -185,6 +187,51 @@ export async function exportBook(
   for (const [, r] of standalone) allImageNotes.push(r);
   const imageBytes = db.fetchMedia(allImageNotes);
 
+  // ---- weread 对齐字段的数据收集（源文件 / 进度 / 访问时间 / 封面）----
+  const sourceInfos = db.fetchBookSources(md5List);
+  const bookConfigs = db.fetchBookConfigs(md5List);
+
+  // 按 md5List 顺序找第一个本机可用书源 → 提取封面，随笔记图片一起写 assets。
+  let coverKey: string | null = null;
+  let bookId: string | null = null;
+  for (const key of md5List) {
+    const info: BookSourceInfo | undefined = sourceInfos.get(key);
+    if (!info) continue;
+    bookId = info.md5 || key;
+    if (!resolveBookSourcePath(info)) continue;
+    const coverData = await extractCover(info);
+    if (coverData) {
+      coverKey = `cover-${bookId}`;
+      imageBytes.set(coverKey, coverData);
+      break;
+    }
+  }
+  if (!bookId) bookId = md5List[0] ?? null;
+
+  // progress：多 md5 取最大进度；无记录时为 null。
+  let progressPct: number | null = null;
+  for (const key of md5List) {
+    const v = bookConfigs.get(key);
+    if (v != null && (progressPct == null || v > progressPct)) progressPct = v;
+  }
+
+  const topicVisits = db.fetchTopicVisits([...byTopic.keys()]);
+  let lastVisitTs: number | null = null;
+  for (const v of topicVisits.values()) {
+    if (v != null && (lastVisitTs == null || v > lastVisitTs)) lastVisitTs = v;
+  }
+
+  // 本书最早 / 最晚笔记时间
+  let earliestTs: number | null = null;
+  let latestTs: number | null = null;
+  for (const r of rows) {
+    for (const ts of [r.ZNOTE_DATE, r.ZHIGHLIGHT_DATE]) {
+      if (ts == null) continue;
+      if (earliestTs == null || ts < earliestTs) earliestTs = ts;
+      if (latestTs == null || ts > latestTs) latestTs = ts;
+    }
+  }
+
   const folderRel = settings.folderGrouping ? bookMeta.folder || "" : "";
   const folderSegs = folderRel.split("/").filter((s) => s.trim()).map((s) => sanitizeFilename(s));
   const outDir = [state.outRoot, "Books", ...folderSegs].join("/");
@@ -198,6 +245,7 @@ export async function exportBook(
     state.generatedAttachments,
     assetsRel
   );
+  const coverRel = coverKey ? imagePaths.get(coverKey) ?? null : null;
 
   const cardLabels = new Map<string, string>();
   const excerptNorms = new Set<string>();
@@ -313,22 +361,38 @@ export async function exportBook(
 
   const reviewCount = rows.filter((r) => cleanText(r.ZNOTES_TEXT).trim()).length;
   const isMerged = md5List.length > 1;
+
+  const lastReadDate = nsDateToDate(lastVisitTs ?? latestTs);
+  const readingStatus =
+    progressPct == null ? undefined : progressPct >= 0.99 ? "2" : "1";
+
+  // 字段顺序对齐 weread 导出，便于统一看板混排；MN 专有字段放最后。
   const fm: Record<string, unknown> = {
     doc_type: "marginnote-highlights-reviews",
-    bookMd5: isMerged ? md5List : md5List[0],
-    title,
-    noteCount: stats.noteCount,
+    bookId,
     reviewCount,
-    imageCount: stats.imageCount,
-    sourceTopics: [...allSources].sort(),
-    primaryTopic: mainMeta.title,
-    lastNoteUpdate: nsDateToIso(lastUpdateTs),
-    tags: [...tagSet].sort(),
-    marginnote: mainTid ? `${appVer.urlScheme}://notebook/${mainTid}` : undefined,
-    source: appVer.appName,
+    noteCount: stats.noteCount,
   };
-  if (isMerged) fm.mergedBooks = md5List.length;
   if (author) fm.author = author;
+  if (coverRel) fm.cover = coverRel;
+  fm.progress =
+    progressPct == null ? "-1" : `${Math.min(100, Math.round(progressPct * 100))}%`;
+  const readingDate = nsDateToDate(earliestTs);
+  if (readingDate) fm.readingDate = readingDate;
+  if (lastReadDate) fm.lastReadDate = lastReadDate;
+  fm.title = title;
+  if (readingStatus) fm.readingStatus = readingStatus;
+
+  // --- MN 专有字段 ---
+  fm.bookMd5 = isMerged ? md5List : md5List[0];
+  if (isMerged) fm.mergedBooks = md5List.length;
+  fm.imageCount = stats.imageCount;
+  fm.sourceTopics = [...allSources].sort();
+  fm.primaryTopic = mainMeta.title;
+  fm.lastNoteUpdate = nsDateToIso(lastUpdateTs);
+  fm.tags = [...tagSet].sort();
+  fm.marginnote = mainTid ? `${appVer.urlScheme}://notebook/${mainTid}` : undefined;
+  fm.source = appVer.appName;
 
   const bodyLines: string[] = [];
   if (mainBody.some((l) => l.trim())) {
