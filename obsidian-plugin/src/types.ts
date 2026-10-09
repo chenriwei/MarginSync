@@ -89,6 +89,8 @@ export interface SyncResult {
   written: number;
   unchanged: number;
   skippedEmpty: number;
+  /** 导出失败的书 / 笔记本数；> 0 时本次跳过了孤儿清理。 */
+  failed: number;
   prunedOrphans: number;
   files: string[];
 }

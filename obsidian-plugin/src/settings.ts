@@ -16,6 +16,8 @@ export interface LastSyncSummary {
   written: number;
   unchanged: number;
   skippedEmpty: number;
+  /** 导出失败的书 / 笔记本数（旧版本保存的数据里没有该字段）。 */
+  failed?: number;
   prunedOrphans: number;
   error?: string;
 }
@@ -31,8 +33,6 @@ export interface MarginSyncSettings {
   bookExportMode: BookExportMode;
   /** by-book 模式下按 MarginNote 书架文件夹（ZBOOK.ZPATH）分子目录。 */
   folderGrouping: boolean;
-  /** 思维导图 Topic 导出时递归子思维导图（ZCHILDMAPNOTEID）。 */
-  recurseChildMindmaps: boolean;
   /** Obsidian 私有图片宽度语法 `![|N](path)` 的 N；0 为关闭，标准 markdown。 */
   imageWidth: number;
   /** 是否在同步结束时把上次生成、本次未再生成的 .md 视为孤儿清理掉。 */
@@ -49,7 +49,6 @@ export const DEFAULT_SETTINGS: MarginSyncSettings = {
   scope: "all",
   bookExportMode: "by-book",
   folderGrouping: true,
-  recurseChildMindmaps: true,
   imageWidth: 0,
   pruneOrphans: true,
   keepAiNodes: false,
@@ -132,7 +131,9 @@ export class MarginSyncSettingTab extends PluginSettingTab {
           .setPlaceholder("MarginSync")
           .setValue(this.plugin.settings.outputDir)
           .onChange(async (value) => {
-            this.plugin.settings.outputDir = normalizePath(value || "MarginSync");
+            const dir = normalizePath(value.trim() || "MarginSync");
+            // vault 根目录不能作为输出目录：孤儿清理会扫描整个 vault。
+            this.plugin.settings.outputDir = dir === "/" || dir === "." ? "MarginSync" : dir;
             await this.plugin.saveSettings();
           })
       )
@@ -171,16 +172,6 @@ export class MarginSyncSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
-      .setName("递归子思维导图")
-      .setDesc("导出思维导图 Topic 时，跟随 ZCHILDMAPNOTEID 递归导出嵌套子图（父 - 子 命名）。")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.recurseChildMindmaps).onChange(async (value) => {
-          this.plugin.settings.recurseChildMindmaps = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
     // ---- 同步范围 ----
     new Setting(containerEl)
       .setName("同步范围")
@@ -214,7 +205,10 @@ export class MarginSyncSettingTab extends PluginSettingTab {
     // ---- 孤儿清理 ----
     new Setting(containerEl)
       .setName("孤儿清理")
-      .setDesc("同步结束后把上次生成、本次未再生成的 .md 删除（同步 MarginNote 端的删除/改名）。")
+      .setDesc(
+        "同步结束后把上次生成、本次未再生成的 .md 移入回收站（同步 MarginNote 端的删除/改名）。" +
+          "只处理本次同步范围内、带 MarginSync frontmatter 标记的文件；有导出失败时自动跳过。"
+      )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.pruneOrphans).onChange(async (value) => {
           this.plugin.settings.pruneOrphans = value;
@@ -290,7 +284,8 @@ export class MarginSyncSettingTab extends PluginSettingTab {
       `${last.at} · ✏️ 实写 ${last.written}` +
       ` · ♻️ 未变化 ${last.unchanged}` +
       ` · ⏭ 空跳过 ${last.skippedEmpty}` +
-      (last.prunedOrphans ? ` · 🧹 清孤儿 ${last.prunedOrphans}` : "");
+      (last.prunedOrphans ? ` · 🧹 清孤儿 ${last.prunedOrphans}` : "") +
+      (last.failed ? ` · ⚠️ 失败 ${last.failed}（已跳过孤儿清理）` : "");
   }
 
   // ---------- 行为按钮 ----------

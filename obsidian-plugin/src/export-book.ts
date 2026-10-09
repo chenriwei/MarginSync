@@ -3,7 +3,7 @@
  */
 
 import { Vault } from "obsidian";
-import type { MarginDb, AppVersion, BookSourceInfo } from "./db";
+import { extractPaintHash, type MarginDb, type AppVersion, type BookSourceInfo } from "./db";
 import { extractCover, resolveBookSourcePath } from "./cover";
 import {
   emitExtrasPara,
@@ -37,6 +37,7 @@ import {
   allocateMdPath,
   assetsRelPath,
   writeIfChanged,
+  findExistingAsset,
   writeImageAssets,
 } from "./vault-io";
 
@@ -49,6 +50,8 @@ export interface ExportRunState {
   written: number;
   unchanged: number;
   skippedEmpty: number;
+  /** 导出抛异常的书 / 笔记本数；> 0 时跳过孤儿清理，避免误删它们上次导出的文件。 */
+  failed: number;
 }
 
 function normComment(text: string | null | undefined): string {
@@ -58,6 +61,44 @@ function normComment(text: string | null | undefined): string {
 
 function labelNorm(n: Note): string | null {
   return normalizeExcerpt(n.ZHIGHLIGHT_TEXT) || normalizeExcerpt(n.ZNOTETITLE);
+}
+
+/** 图片的身份标识：优先 paint hash，否则原始字节（base64）；无图返回 null。 */
+function imageIdentity(blob: Buffer | null): string | null {
+  if (!blob || !blob.length) return null;
+  return extractPaintHash(blob) ?? blob.toString("base64");
+}
+
+/**
+ * 与 Python _pick_book_source 一致：按 md5List 顺序取第一个本机可用书源作为
+ * bookId 并尝试提取封面；没有可用书源时 bookId 取第一本的 ZMD5。
+ *
+ * assets 里已有 ``cover-<bookId>.*`` 时直接复用（返回 ``existing`` 文件名），
+ * 不再每次同步都调 qlmanage / python3 重新渲染。
+ */
+export async function pickBookIdAndCover(
+  vault: Vault,
+  outRoot: string,
+  md5List: string[],
+  sourceInfos: Map<string, BookSourceInfo>
+): Promise<{ bookId: string | null; cover: Buffer | null; existing: string | null }> {
+  for (const key of md5List) {
+    const info = sourceInfos.get(key);
+    if (!info || !resolveBookSourcePath(info)) continue;
+    const bookId = info.md5 || key;
+    const existing = await findExistingAsset(vault, outRoot, `cover-${bookId}`);
+    if (existing) return { bookId, cover: null, existing };
+    let cover: Buffer | null = null;
+    try {
+      cover = await extractCover(info);
+    } catch {
+      cover = null;
+    }
+    return { bookId, cover, existing: null };
+  }
+  const first = md5List[0];
+  if (first == null) return { bookId: null, cover: null, existing: null };
+  return { bookId: sourceInfos.get(first)?.md5 || first, cover: null, existing: null };
 }
 
 export async function exportBook(
@@ -99,15 +140,15 @@ export async function exportBook(
     return [withLinks, ns.length, meta?.isMindmap ? 1 : 0, tid];
   };
 
+  // "" 是无 Topic 笔记的合法分组 key，不能当"尚未选出"的哨兵值。
   const mainTid = [...byTopic.keys()].reduce((best, tid) => {
-    if (!best) return tid;
     const sa = topicScore(tid);
     const sb = topicScore(best);
     for (let i = 0; i < 4; i++) {
       if (sa[i] !== sb[i]) return sa[i] > sb[i] ? tid : best;
     }
     return best;
-  }, "");
+  });
 
   const mainMeta = topicMeta.get(mainTid) || { title: "(无 Topic)", isMindmap: false };
   let roots: TreeNode[] = [];
@@ -167,6 +208,15 @@ export async function exportBook(
           primary = mainKeysLoose.get(JSON.stringify([r.ZSTARTPAGE ?? 0, label]));
         }
       }
+      // 合并只搬运批注文本；补充 note 自带的图片与主节点不同时，合并会把图片
+      // 丢掉，改走 standalone 完整渲染。
+      if (primary && r.ZNOTEID !== primary.ZNOTEID) {
+        const img = imageIdentity(r.ZHIGHLIGHT_PIC);
+        if (img != null && img !== imageIdentity(primary.ZHIGHLIGHT_PIC)) {
+          standalone.push([ttitle, r]);
+          continue;
+        }
+      }
       if (primary) {
         if (!r.ZNOTES_TEXT) continue;
         if (r.ZNOTEID === primary.ZNOTEID) continue;
@@ -192,21 +242,13 @@ export async function exportBook(
   const bookConfigs = db.fetchBookConfigs(md5List);
 
   // 按 md5List 顺序找第一个本机可用书源 → 提取封面，随笔记图片一起写 assets。
+  const picked = await pickBookIdAndCover(state.vault, state.outRoot, md5List, sourceInfos);
+  const bookId = picked.bookId;
   let coverKey: string | null = null;
-  let bookId: string | null = null;
-  for (const key of md5List) {
-    const info: BookSourceInfo | undefined = sourceInfos.get(key);
-    if (!info) continue;
-    bookId = info.md5 || key;
-    if (!resolveBookSourcePath(info)) continue;
-    const coverData = await extractCover(info);
-    if (coverData) {
-      coverKey = `cover-${bookId}`;
-      imageBytes.set(coverKey, coverData);
-      break;
-    }
+  if (picked.cover && bookId) {
+    coverKey = `cover-${bookId}`;
+    imageBytes.set(coverKey, picked.cover);
   }
-  if (!bookId) bookId = md5List[0] ?? null;
 
   // progress：多 md5 取最大进度；无记录时为 null。
   let progressPct: number | null = null;
@@ -245,7 +287,11 @@ export async function exportBook(
     state.generatedAttachments,
     assetsRel
   );
-  const coverRel = coverKey ? imagePaths.get(coverKey) ?? null : null;
+  let coverRel = coverKey ? imagePaths.get(coverKey) ?? null : null;
+  if (picked.existing) {
+    state.generatedAttachments.add(`${state.outRoot}/assets/${picked.existing}`);
+    coverRel = `${assetsRel}/${picked.existing}`;
+  }
 
   const cardLabels = new Map<string, string>();
   const excerptNorms = new Set<string>();
@@ -419,11 +465,14 @@ export async function exportAllBooks(
 ): Promise<void> {
   const books = db.listBooks();
   if (!books.length) return;
+  // 按 md5 稳定排序：同名书的 (1)/(2) 后缀不随笔记数变化而互换。
+  books.sort((a, b) => (a.md5List[0] < b.md5List[0] ? -1 : a.md5List[0] > b.md5List[0] ? 1 : 0));
   for (const meta of books) {
     if (!settings.folderGrouping) meta.folder = "";
     try {
       await exportBook(db, meta, appVer, settings, state);
     } catch (e) {
+      state.failed += 1;
       console.error(`MarginSync: 《${meta.title}》导出失败`, e);
     }
   }

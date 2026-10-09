@@ -29,6 +29,11 @@ export async function syncMarginNote(
     new Notice("MarginSync: 请先在设置里填写 MarginNote 数据库路径");
     throw new Error("databasePath 未配置");
   }
+  const outRoot = normalizePath(settings.outputDir || "MarginSync");
+  if (!outRoot || outRoot === "/" || outRoot === ".") {
+    // 输出到 vault 根目录时，孤儿清理的扫描范围会覆盖整个 vault。
+    throw new Error("输出子目录不能是 vault 根目录，请在设置里指定一个子目录");
+  }
   const pluginDir = resolvePluginDir(app, pluginDirRel);
   const appVer = detectAppVersion(dbPath);
   const db = new MarginDb(dbPath, pluginDir);
@@ -37,12 +42,12 @@ export async function syncMarginNote(
     written: 0,
     unchanged: 0,
     skippedEmpty: 0,
+    failed: 0,
     prunedOrphans: 0,
     files: [],
   };
 
   try {
-    const outRoot = normalizePath(settings.outputDir || "MarginSync");
     const generatedPaths = new Set<string>();
     const generatedAttachments = new Set<string>();
     const filenamesPerDir = new Map<string, Set<string>>();
@@ -56,6 +61,7 @@ export async function syncMarginNote(
       written: 0,
       unchanged: 0,
       skippedEmpty: 0,
+      failed: 0,
     };
 
     const scope = settings.scope;
@@ -90,11 +96,19 @@ export async function syncMarginNote(
     result.written = state.written;
     result.unchanged = state.unchanged;
     result.skippedEmpty = state.skippedEmpty;
+    result.failed = state.failed;
     result.files = [...generatedPaths];
 
-    if (settings.pruneOrphans) {
+    // 失败的书 / 笔记本没登记进 generatedPaths，此时清理会误删它们上次导出的文件。
+    if (settings.pruneOrphans && state.failed === 0) {
+      // 只清理本次导出范围拥有的子目录；assets 被书籍和思维导图共用，全量导出时才清理。
+      const exportsBooks = exportBooksByBook || exportBookTopics;
+      const subdirs: string[] = [];
+      if (exportsBooks) subdirs.push("Books");
+      if (exportMindmapTopics) subdirs.push("MindMaps");
+      if (exportsBooks && exportMindmapTopics) subdirs.push("assets");
       const kept = new Set<string>([...generatedPaths, ...generatedAttachments]);
-      result.prunedOrphans = await pruneOrphans(app.vault, outRoot, kept);
+      result.prunedOrphans = await pruneOrphans(app, outRoot, subdirs, kept);
     }
   } finally {
     db.close();

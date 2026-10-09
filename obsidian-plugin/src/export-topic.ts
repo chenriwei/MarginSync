@@ -2,8 +2,7 @@
  * 按 Topic 导出（思维导图树状渲染 + 子思维导图递归）。
  */
 
-import type { MarginDb, AppVersion, BookSourceInfo } from "./db";
-import { extractCover, resolveBookSourcePath } from "./cover";
+import type { MarginDb, AppVersion } from "./db";
 import {
   cleanText,
   extractHashtags,
@@ -19,7 +18,7 @@ import { renderMindmapNode } from "./render-mindmap";
 import type { MarginSyncSettings } from "./settings";
 import type { RenderContext, RenderStats, Topic } from "./types";
 import { buildTree } from "./tree";
-import type { ExportRunState } from "./export-book";
+import { pickBookIdAndCover, type ExportRunState } from "./export-book";
 import { allocateMdPath, writeIfChanged, writeImageAssets } from "./vault-io";
 
 function collectCardLabels(notes: ReturnType<MarginDb["fetchNotes"]>): Map<string, string> {
@@ -83,13 +82,8 @@ async function exportOneTopic(
   appVer: AppVersion,
   settings: MarginSyncSettings,
   state: ExportRunState,
-  parentTitles: string[],
-  visited: Set<string>,
   useMindmapTree: boolean
 ): Promise<void> {
-  if (visited.has(topic.ZTOPICID)) return;
-  visited.add(topic.ZTOPICID);
-
   const title = topic.ZTITLE || "Untitled";
   const isMindmap = !!topic.ZMINDLINKS;
   const notes = db.fetchNotes(topic.ZTOPICID).filter((n) => isKept(n, settings.keepAiNodes));
@@ -153,10 +147,9 @@ async function exportOneTopic(
 
   const subdir = isMindmap ? "MindMaps" : "Books";
   const dir = `${state.outRoot}/${subdir}`;
-  const stem = [...parentTitles, title].map((t) => sanitizeFilename(t)).join(" - ");
   const used = state.filenamesPerDir.get(dir) || new Set<string>();
   state.filenamesPerDir.set(dir, used);
-  const filePath = allocateMdPath(dir, stem, used, state.generatedPaths);
+  const filePath = allocateMdPath(dir, sanitizeFilename(title), used, state.generatedPaths);
 
   const bookMd5List: string[] = [];
   if (topic.ZBOOKLIST) {
@@ -174,27 +167,26 @@ async function exportOneTopic(
   const bookConfigs = db.fetchBookConfigs(bookMd5List);
 
   let coverRel: string | null = null;
-  let bookId: string | null = null;
-  for (const key of bookMd5List) {
-    const info: BookSourceInfo | undefined = sourceInfos.get(key);
-    if (!info) continue;
-    bookId = info.md5 || key;
-    if (!resolveBookSourcePath(info)) continue;
-    const coverData = await extractCover(info);
-    if (coverData) {
-      // md 位于 Books|MindMaps/<name>.md，assets 是同级目录，用默认 ../assets。
-      const coverKey = `cover-${bookId}`;
-      const coverPaths = await writeImageAssets(
-        state.vault,
-        state.outRoot,
-        new Map([[coverKey, coverData]]),
-        state.generatedAttachments
-      );
-      coverRel = coverPaths.get(coverKey) ?? null;
-      break;
-    }
+  const { bookId, cover, existing } = await pickBookIdAndCover(
+    state.vault,
+    state.outRoot,
+    bookMd5List,
+    sourceInfos
+  );
+  if (existing) {
+    state.generatedAttachments.add(`${state.outRoot}/assets/${existing}`);
+    coverRel = `../assets/${existing}`;
+  } else if (cover && bookId) {
+    // md 位于 Books|MindMaps/<name>.md，assets 是同级目录，用默认 ../assets。
+    const coverKey = `cover-${bookId}`;
+    const coverPaths = await writeImageAssets(
+      state.vault,
+      state.outRoot,
+      new Map([[coverKey, cover]]),
+      state.generatedAttachments
+    );
+    coverRel = coverPaths.get(coverKey) ?? null;
   }
-  if (!bookId) bookId = bookMd5List[0] ?? null;
 
   let progressPct: number | null = null;
   for (const key of bookMd5List) {
@@ -271,27 +263,8 @@ async function exportOneTopic(
   const changed = await writeIfChanged(state.vault, filePath, content);
   if (changed) state.written += 1;
   else state.unchanged += 1;
-
-  if (!settings.recurseChildMindmaps || !isMindmap) return;
-
-  const childIds = new Set<string>();
-  for (const n of notes) {
-    if (n.ZCHILDMAPNOTEID) childIds.add(n.ZCHILDMAPNOTEID);
-  }
-  for (const childId of childIds) {
-    const child = db.getTopic(childId);
-    if (!child) continue;
-    await exportOneTopic(
-      db,
-      child,
-      appVer,
-      settings,
-      state,
-      [...parentTitles, title],
-      visited,
-      useMindmapTree
-    );
-  }
+  // ZCHILDMAPNOTEID 指向的是同一 Topic 内的脑图根节点（ZNOTEID），不是另一个
+  // Topic；子脑图内容已经随本 Topic 的 fetchNotes 一起导出，无需递归。
 }
 
 export async function exportTopics(
@@ -302,23 +275,20 @@ export async function exportTopics(
   state: ExportRunState,
   options: { mindmapsOnly?: boolean; booksOnly?: boolean } = {}
 ): Promise<void> {
-  const visited = new Set<string>();
-  for (const topic of topics) {
+  // 按创建时间 + ID 稳定排序：同名笔记本的 (1)/(2) 后缀不再随"最近访问"漂移。
+  const ordered = [...topics].sort(
+    (a, b) =>
+      (a.ZDATE ?? 0) - (b.ZDATE ?? 0) ||
+      (a.ZTOPICID < b.ZTOPICID ? -1 : a.ZTOPICID > b.ZTOPICID ? 1 : 0)
+  );
+  for (const topic of ordered) {
     const isMindmap = !!topic.ZMINDLINKS;
     if (options.mindmapsOnly && !isMindmap) continue;
     if (options.booksOnly && isMindmap) continue;
     try {
-      await exportOneTopic(
-        db,
-        topic,
-        appVer,
-        settings,
-        state,
-        [],
-        visited,
-        isMindmap
-      );
+      await exportOneTopic(db, topic, appVer, settings, state, isMindmap);
     } catch (e) {
+      state.failed += 1;
       console.error(`MarginSync: Topic《${topic.ZTITLE}》导出失败`, e);
     }
   }

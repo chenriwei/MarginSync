@@ -24,6 +24,10 @@ const CATEGORY_PREFIX = /^\$\$\$CATEGORY\d+\$\$\$/;
 // 不属于真实的书，by-book 聚合（Books/）时必须排除，只让它走 MindMaps/。
 const STUDY_SET_SUFFIX = "_StudySet";
 const FILE_EXT_RE = /\.(pdf|epub|mobi|txt|docx?|mp4|pptx?|html?)$/i;
+// 笔记本被删除后，其 ZBOOKNOTE 行可能残留（ZTOPICID 指向不存在的 Topic）。
+// 这些笔记在 MarginNote 里已不可见，导出时必须排除，否则会"复活"成未知书籍。
+const LIVE_TOPIC_COND =
+  "(bn.ZTOPICID IS NULL OR EXISTS (SELECT 1 FROM ZTOPIC lt WHERE lt.ZTOPICID = bn.ZTOPICID))";
 
 // ---------- 图片字节工具 ----------
 
@@ -171,9 +175,13 @@ export class MarginDb {
   constructor(public readonly dbPath: string, pluginDir: string | null) {
     if (!dbPath) throw new Error("MarginSync: 数据库路径未配置");
     this.db = openMarginDatabase(pluginDir, dbPath);
+    // 整轮同步共享一个读事务快照：MarginNote 运行时也在写库，不包事务的话
+    // 书单 / 笔记 / 图片可能来自不同时刻，前后对不上。
+    this.db.exec("BEGIN");
   }
 
   close(): void {
+    if (this.db.inTransaction) this.db.exec("ROLLBACK");
     this.db.close();
   }
 
@@ -187,16 +195,6 @@ export class MarginDb {
       )
       .all() as Topic[];
     return rows.filter((r) => r.ZTOPICID && r.ZTITLE);
-  }
-
-  getTopic(topicId: string): Topic | null {
-    const row = this.db
-      .prepare(
-        `SELECT ZTOPICID, ZTITLE, ZLOCALBOOKMD5 AS bookMd5, ZMINDLINKS, ZBOOKLIST, ZDATE, ZLASTVISIT
-         FROM ZTOPIC WHERE ZTOPICID = ?`
-      )
-      .get(topicId) as Topic | undefined;
-    return row?.ZTOPICID ? row : null;
   }
 
   /** 抓某个 Topic 下的所有 ZBOOKNOTE（含从 ZMINDLINKS 跟踪到的层级链接）。 */
@@ -269,7 +267,6 @@ export class MarginDb {
         allHashes.add(h);
       }
     }
-    if (!allHashes.size) return new Map();
 
     const hashToData = new Map<string, Buffer>();
     const hashList = [...allHashes];
@@ -294,7 +291,7 @@ export class MarginDb {
     } catch {
       sidecarExists = false;
     }
-    if (sidecarExists) {
+    if (sidecarExists && allHashes.size) {
       for (const h of allHashes) {
         if (hashToData.has(h)) continue;
         const p = path.join(sidecarDir, h);
@@ -310,10 +307,23 @@ export class MarginDb {
       }
     }
 
+    // 对应 Python _resolve_note_image：ZMEDIA / sidecar 都没取到时，回退到
+    // ZHIGHLIGHT_PIC 自身（裸图片或 NSKeyedArchiver 包裹）；过滤 1×1 占位图。
     const result = new Map<string, Buffer>();
-    for (const [nid, h] of noteToHash) {
-      const d = hashToData.get(h);
-      if (d) result.set(nid, d);
+    for (const n of notes) {
+      if (!n.ZHIGHLIGHT_PIC || result.has(n.ZNOTEID)) continue;
+      const h = noteToHash.get(n.ZNOTEID);
+      let d = h ? hashToData.get(h) ?? null : null;
+      if (!d) {
+        d = isBplist(n.ZHIGHLIGHT_PIC)
+          ? unwrapMediaData(n.ZHIGHLIGHT_PIC)
+          : looksLikeImage(n.ZHIGHLIGHT_PIC)
+            ? n.ZHIGHLIGHT_PIC
+            : null;
+      }
+      if (!d) continue;
+      if (d.subarray(0, 4).equals(IMAGE_MAGIC[0]) && d.length < 256) continue;
+      result.set(n.ZNOTEID, d);
     }
     return result;
   }
@@ -332,7 +342,7 @@ export class MarginDb {
             t.ZTITLE AS topicTitle, t.ZMINDLINKS AS topicMindlinks
          FROM ZBOOKNOTE bn
          LEFT JOIN ZTOPIC t ON t.ZTOPICID = bn.ZTOPICID
-         WHERE bn.ZBOOKMD5 IN (${placeholders})
+         WHERE bn.ZBOOKMD5 IN (${placeholders}) AND ${LIVE_TOPIC_COND}
          ORDER BY bn.ZTOPICID, bn.ZSTARTPAGE, bn.ZSTARTPOS, bn.ZNOTEID`
       )
       .all(...md5List) as BookNoteRow[];
@@ -500,8 +510,9 @@ export class MarginDb {
     const countRows = (
       this.db
         .prepare(
-          `SELECT ZBOOKMD5 AS md5, COUNT(*) AS noteCount
-           FROM ZBOOKNOTE WHERE ZBOOKMD5 IS NOT NULL GROUP BY ZBOOKMD5`
+          `SELECT bn.ZBOOKMD5 AS md5, COUNT(*) AS noteCount
+           FROM ZBOOKNOTE bn WHERE bn.ZBOOKMD5 IS NOT NULL AND ${LIVE_TOPIC_COND}
+           GROUP BY bn.ZBOOKMD5`
         )
         .all() as { md5: string; noteCount: number }[]
     ).filter((r) => !r.md5.endsWith(STUDY_SET_SUFFIX));

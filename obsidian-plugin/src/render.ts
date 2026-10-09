@@ -320,6 +320,17 @@ export function renderNoteWeread(
 
 // ---------- frontmatter ----------
 
+/** YAML 双引号字符串转义（与 Python 端 _yaml_escape 一致）。 */
+function yamlQuote(value: string): string {
+  const s = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t");
+  return `"${s}"`;
+}
+
 /** 渲染 YAML frontmatter（保持和 Python 端 render_frontmatter 兼容的引号策略）。 */
 export function renderFrontmatter(fm: Record<string, unknown>): string {
   const lines: string[] = ["---"];
@@ -329,14 +340,12 @@ export function renderFrontmatter(fm: Record<string, unknown>): string {
       if (!v.length) continue;
       lines.push(`${k}:`);
       for (const item of v) {
-        lines.push(`  - "${String(item).replace(/"/g, '\\"')}"`);
+        lines.push(`  - ${yamlQuote(String(item))}`);
       }
-    } else if (typeof v === "string") {
-      lines.push(`${k}: "${v.replace(/"/g, '\\"')}"`);
     } else if (typeof v === "number" || typeof v === "boolean") {
       lines.push(`${k}: ${v}`);
     } else {
-      lines.push(`${k}: "${String(v).replace(/"/g, '\\"')}"`);
+      lines.push(`${k}: ${yamlQuote(String(v))}`);
     }
   }
   lines.push("---");
@@ -366,25 +375,43 @@ export function nsDateToDate(ts: number | null): string | null {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** 把字符串变成安全的文件名（去掉 / : * ? " < > | 等）。 */
-export function sanitizeFilename(name: string): string {
-  return name
-    .replace(/[\\/:*?"<>|#[\]]/g, "_")
+/**
+ * 把字符串变成安全的文件名，规则与 Python 端 sanitize_filename 一致，
+ * 保证 CLI 与插件对同一本书生成同一个文件名。
+ * 同时禁掉 Obsidian wikilink 解析时会被截断的字符（# ^ [ ]）。
+ */
+export function sanitizeFilename(name: string, maxLen = 80): string {
+  let s = name
+    .replace(/[\\/:*?"<>|#^[\]]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 200) || "Untitled";
+    // 开头的 "." 会让 Obsidian 当作隐藏文件忽略。
+    .replace(/^\.+/, "")
+    .trim();
+  const chars = Array.from(s);
+  if (chars.length > maxLen) s = chars.slice(0, maxLen).join("").trimEnd();
+  return s || "Untitled";
+}
+
+// AI 上下文节点的两个特征性 placeholder（与 Python 端 AI_CONTEXT_MARKERS 一致）。
+const AI_CONTEXT_MARKERS = ["{{文档上下文}}", "{{MindMap Context}}"];
+
+/** ZTYPE=9 且标题含上下文 placeholder 的是 AI 上下文节点。 */
+export function isAiContextNode(note: Note): boolean {
+  if (note.ZTYPE !== 9) return false;
+  const title = note.ZNOTETITLE || "";
+  return AI_CONTEXT_MARKERS.some((m) => title.includes(m));
+}
+
+/** ZTYPE=9 且不是上下文节点，认为是 AI 的回答。 */
+export function isAiAnswerNode(note: Note): boolean {
+  return note.ZTYPE === 9 && !isAiContextNode(note);
 }
 
 /** 是否需要保留这条 note（过滤 AI 节点 / 全空占位）。 */
 export function isKept(note: Note, keepAi: boolean): boolean {
-  // ZTYPE 标记：1=划线 2=笔记 6=mindmap 节点 等。
-  // AI 上下文 / AI 答复节点的常见判定：标题以特定 emoji 开头。Python 端用了
-  // is_ai_context_node / is_ai_answer_node，TS 这边先用最常见的两条：
-  const title = note.ZNOTETITLE || "";
-  const isAiCtx = /^🤖\s*AI/.test(title) || /^🌟\s*AI 上下文/.test(title);
-  const isAiAns = /^🤖\s*AI 答复/.test(title);
-  if (isAiCtx) return false;
-  if (isAiAns && !keepAi) return false;
+  if (isAiContextNode(note)) return false;
+  if (isAiAnswerNode(note) && !keepAi) return false;
   if (!note.ZHIGHLIGHT_TEXT && !note.ZNOTES_TEXT && !note.ZHIGHLIGHT_PIC && !note.ZNOTETITLE) {
     return false;
   }

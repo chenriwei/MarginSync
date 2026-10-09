@@ -67,7 +67,8 @@ export function buildTree(notes: Note[]): TreeNode[] {
   for (const [nid, n] of noteMap) {
     nodes.set(nid, { note: n, children: [] });
   }
-  const childrenSet = new Set<string>();
+  // 每个节点只挂到第一个父节点下：多父会导致重复渲染。
+  const parentOf = new Map<string, string>();
 
   for (const note of notes) {
     if (!note.ZMINDLINKS || !note.ZNOTEID) continue;
@@ -75,17 +76,42 @@ export function buildTree(notes: Note[]): TreeNode[] {
     if (!parent) continue;
     for (const cid of note.ZMINDLINKS.split("|")) {
       const child = nodes.get(cid);
-      if (child) {
+      if (child && cid !== note.ZNOTEID && !parentOf.has(cid)) {
         parent.children.push(child);
-        childrenSet.add(cid);
+        parentOf.set(cid, note.ZNOTEID);
       }
     }
   }
 
   const roots: TreeNode[] = [];
   for (const [nid, n] of nodes) {
-    if (!childrenSet.has(nid)) roots.push(n);
+    if (!parentOf.has(nid)) roots.push(n);
   }
+
+  // ZMINDLINKS 成环时，环上节点都有父节点 → 不会成为根 → 整段丢失，且递归
+  // 排序 / 渲染会无限下钻。把从根不可达的节点按 ID 顺序提升为根以拆环。
+  const reachable = new Set<string>();
+  const mark = (start: TreeNode) => {
+    const stack = [start];
+    while (stack.length) {
+      const tn = stack.pop()!;
+      if (reachable.has(tn.note.ZNOTEID)) continue;
+      reachable.add(tn.note.ZNOTEID);
+      stack.push(...tn.children);
+    }
+  };
+  for (const r of roots) mark(r);
+  for (const nid of [...nodes.keys()].sort()) {
+    if (reachable.has(nid)) continue;
+    const pid = parentOf.get(nid)!;
+    parentOf.delete(nid);
+    const parent = nodes.get(pid)!;
+    parent.children = parent.children.filter((c) => c.note.ZNOTEID !== nid);
+    const node = nodes.get(nid)!;
+    roots.push(node);
+    mark(node);
+  }
+
   sortRecursive(roots);
   return pruneEmptyBranches(roots);
 }

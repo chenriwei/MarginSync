@@ -4,6 +4,7 @@ import { syncMarginNote } from "./sync";
 
 export default class MarginSyncPlugin extends Plugin {
   settings!: MarginSyncSettings;
+  private syncing = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -29,6 +30,12 @@ export default class MarginSyncPlugin extends Plugin {
    * 设置面板顶部的"上次同步"banner 读这个字段。
    */
   async runSync(): Promise<void> {
+    // 两轮同步交错执行时，一轮的孤儿清理会删掉另一轮刚写的文件。
+    if (this.syncing) {
+      new Notice("MarginSync: 已有同步在进行中");
+      return;
+    }
+    this.syncing = true;
     const inProgress = new Notice("MarginSync: 同步中…", 0);
     try {
       const result = await syncMarginNote(
@@ -42,6 +49,7 @@ export default class MarginSyncPlugin extends Plugin {
         written: result.written,
         unchanged: result.unchanged,
         skippedEmpty: result.skippedEmpty,
+        failed: result.failed,
         prunedOrphans: result.prunedOrphans,
       };
       await this.saveSettings();
@@ -49,7 +57,8 @@ export default class MarginSyncPlugin extends Plugin {
         `MarginSync 完成 — ✏️ 实写 ${result.written}，` +
           `♻️ 未变化 ${result.unchanged}，` +
           `⏭ 空跳过 ${result.skippedEmpty}` +
-          (result.prunedOrphans ? `，🧹 清孤儿 ${result.prunedOrphans}` : ""),
+          (result.prunedOrphans ? `，🧹 清孤儿 ${result.prunedOrphans}` : "") +
+          (result.failed ? `，⚠️ ${result.failed} 个导出失败（已跳过孤儿清理，详见控制台）` : ""),
         8000
       );
     } catch (e) {
@@ -66,6 +75,8 @@ export default class MarginSyncPlugin extends Plugin {
       };
       await this.saveSettings();
       new Notice("MarginSync 同步失败：" + msg, 10000);
+    } finally {
+      this.syncing = false;
     }
   }
 

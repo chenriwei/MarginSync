@@ -6,7 +6,6 @@ import {
   backlink,
   cleanText,
   escapeMdHeader,
-  isKept,
   resolveDedup,
   splitCardLinks,
   splitTagsFromComment,
@@ -84,14 +83,8 @@ export function renderMindmapNode(
   stats: RenderStats,
   forceList: boolean
 ): void {
+  // AI 节点 / 全空占位已在建树前按用户设置（isKept）过滤，这里不再重复判断。
   const note = node.note;
-  if (!isKept(note, false)) {
-    for (const child of node.children) {
-      renderMindmapNode(child, level, lines, ctx, stats, forceList);
-    }
-    return;
-  }
-
   const title = cleanText(note.ZNOTETITLE);
   const excerpt = cleanText(note.ZHIGHLIGHT_TEXT);
   const rawComment = cleanText(note.ZNOTES_TEXT);
@@ -105,7 +98,11 @@ export function renderMindmapNode(
   const hasBody = !!(excerptToShow || comment || imagePath || cardIds.length);
 
   if (!title && !hasBody) {
+    // 自身没有可显示内容（如图片取不到、批注只有 hashtag），子树仍要保留。
     stats.skippedEmpty += 1;
+    for (const child of node.children) {
+      renderMindmapNode(child, level, lines, ctx, stats, forceList);
+    }
     return;
   }
 

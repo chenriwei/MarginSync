@@ -10,6 +10,7 @@ Obsidian 友好的 Markdown 文件，输出风格参考 obsidian-weread-plugin�
     python mn_export_tool.py --mindmaps-only  # 只导出思维导图 Topic
     python mn_export_tool.py --by-book        # 按"书"聚合：把同一本 PDF 在所有 Topic
                                               # 中产生的笔记合并到一份 markdown
+    python mn_export_tool.py --by-book --with-mindmaps  # 按书聚合 + 额外导出思维导图
     python mn_export_tool.py --id <topicid>   # 按 ZTOPICID 导出单个 Topic
     python mn_export_tool.py --keep-ai        # 保留 AI 节点（默认过滤）
 """
@@ -77,15 +78,33 @@ class DBContext:
     db_path: str
 
 
+def _connect_readonly(path: str) -> sqlite3.Connection:
+    """只读打开 MarginNote 数据库，并开启一个贯穿整轮导出的读事务。
+
+    MarginNote 的库是 WAL 模式，最新写入可能还在 ``-wal`` 里没合并进主文件。
+    ``mode=ro`` 会读 WAL；``immutable=1`` 完全忽略 WAL 且不加锁（MarginNote
+    运行时会漏数据，甚至读到不一致的页面），只在 ``mode=ro`` 打不开（受限
+    shell / 未授权 TCC 无法访问 -shm）时兜底使用。
+    """
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error:
+        print("⚠️  无法以 WAL 只读模式打开数据库，退回 immutable 快照模式："
+              "MarginNote 运行中未落盘的笔记可能读不到，建议先退出 MarginNote 再导出。")
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro&immutable=1", uri=True, isolation_level=None
+        )
+    # 所有查询共享同一个快照，避免书单 / 笔记 / 图片来自 MarginNote 的不同时刻。
+    conn.execute("BEGIN")
+    return conn
+
+
 def open_database() -> DBContext | None:
     for app_name, url_scheme, path in DB_CANDIDATES:
         if os.path.exists(path):
             try:
-                # 只读 + immutable：本工具只读取数；immutable 让 SQLite 不依赖
-                # -shm/-wal（这两个文件在受限 shell / 未授权 TCC 场景下无法创建），
-                # 快照式读取即可，也避免误改 MarginNote 数据。
-                uri = f"file:{path}?mode=ro&immutable=1"
-                conn = sqlite3.connect(uri, uri=True)
+                conn = _connect_readonly(path)
                 conn.row_factory = sqlite3.Row
                 return DBContext(conn, app_name, url_scheme, path)
             except Exception as exc:  # noqa: BLE001
@@ -605,18 +624,44 @@ def _prune_empty_branches(nodes: list[TreeNode]) -> list[TreeNode]:
 def build_tree(notes: list[sqlite3.Row]) -> list[TreeNode]:
     note_map = {n["ZNOTEID"]: n for n in notes}
     nodes = {nid: TreeNode(note=n) for nid, n in note_map.items()}
-    children_set: set[str] = set()
+    # 每个节点只挂到第一个父节点下：多父会导致重复渲染。
+    parent_of: dict[str, str] = {}
 
     for note in notes:
         if not note["ZMINDLINKS"]:
             continue
-        parent = nodes[note["ZNOTEID"]]
+        nid = note["ZNOTEID"]
+        parent = nodes[nid]
         for cid in note["ZMINDLINKS"].split("|"):
-            if cid in nodes:
+            if cid in nodes and cid != nid and cid not in parent_of:
                 parent.children.append(nodes[cid])
-                children_set.add(cid)
+                parent_of[cid] = nid
 
-    roots = [n for nid, n in nodes.items() if nid not in children_set]
+    roots = [n for nid, n in nodes.items() if nid not in parent_of]
+
+    # ZMINDLINKS 成环时，环上节点都有父节点 → 不会成为根 → 整段丢失，且递归
+    # 排序 / 渲染会无限下钻。把从根不可达的节点按 ID 顺序提升为根以拆环。
+    reachable: set[str] = set()
+
+    def mark(start: TreeNode) -> None:
+        stack = [start]
+        while stack:
+            tn = stack.pop()
+            tid = tn.note["ZNOTEID"]
+            if tid in reachable:
+                continue
+            reachable.add(tid)
+            stack.extend(tn.children)
+
+    for r in roots:
+        mark(r)
+    for nid in sorted(nodes):
+        if nid in reachable:
+            continue
+        pid = parent_of.pop(nid)
+        nodes[pid].children = [c for c in nodes[pid].children if c.note["ZNOTEID"] != nid]
+        roots.append(nodes[nid])
+        mark(nodes[nid])
 
     def sort_key(tn: TreeNode) -> tuple:
         n = tn.note
@@ -657,8 +702,6 @@ class RenderOptions:
     heading_levels: int = 2  # L1->H2, L2->H3, 之后用列表
     # 当根节点没有子树（典型如划线类书籍）时，是否把它们也渲染成列表项
     flat_roots_as_list: bool = True
-    # 是否递归展开子思维导图。Books-only 模式下应当为 False。
-    recurse_child_maps: bool = True
     # 图片宽度。> 0 时输出 Obsidian 私有的 `![|N](path)` 写法限制显示宽度；
     # 默认 0 输出标准 Markdown `![](path)`，对所有渲染器（VS Code、GitHub、
     # Cursor 内置 preview 等）都通用。Obsidian 自身在标准写法下也能正常显示，
@@ -885,10 +928,7 @@ def _emit_image(
     bullet: str | None = None,
 ) -> bool:
     image_filename = f"{note_id}.png"
-    image_path = os.path.join(images_dir, image_filename)
-    if not os.path.exists(image_path):
-        with open(image_path, "wb") as f:
-            f.write(image_data)
+    _write_bytes_if_changed(os.path.join(images_dir, image_filename), image_data)
     rel = f"{options.image_dir_relative}/{image_filename}"
     alt = f"|{options.image_width}" if options.image_width and options.image_width > 0 else ""
     suffix = f"  {trailing_link}" if trailing_link else ""
@@ -1072,7 +1112,13 @@ def render_node(
 
 
 def _yaml_escape(value: str) -> str:
-    s = value.replace("\\", "\\\\").replace('"', '\\"')
+    s = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
     return f'"{s}"'
 
 
@@ -1106,10 +1152,42 @@ _FILENAME_BAD = re.compile(r"[\\/:*?\"<>|#\^\[\]]+")
 
 def sanitize_filename(name: str, max_len: int = 80) -> str:
     name = _FILENAME_BAD.sub(" ", name)
-    name = re.sub(r"\s+", " ", name).strip()
+    # 开头的 "." 会让 Obsidian 当作隐藏文件忽略。
+    name = re.sub(r"\s+", " ", name).strip().lstrip(".").strip()
     if len(name) > max_len:
         name = name[:max_len].rstrip()
     return name or "Untitled"
+
+
+# 文件系统单个文件名上限 255 字节；给 " (99).md" 后缀留余量。80 字中文 = 240 字节。
+_MAX_STEM_BYTES = 240
+
+
+def _cap_stem_bytes(stem: str, max_bytes: int = _MAX_STEM_BYTES) -> str:
+    """多级 Topic 名拼接后可能超出文件名长度上限（中文 3 字节/字），按 UTF-8 字节截断。"""
+    if len(stem.encode("utf-8")) <= max_bytes:
+        return stem
+    out = stem.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return out.rstrip() or "Untitled"
+
+
+def _allocate_md_path(out_dir: str, stem: str, in_run_paths: set[str] | None) -> str:
+    """在本次运行内防撞名，返回可用的 .md 路径并登记到 ``in_run_paths``。
+
+    macOS 默认文件系统大小写不敏感：``Foo.md`` 与 ``foo.md`` 是同一个文件，
+    不按大小写不敏感比较的话，后写的一本会覆盖先写的一本。
+    """
+    stem = _cap_stem_bytes(stem)
+    file_path = os.path.join(out_dir, f"{stem}.md")
+    if in_run_paths is None:
+        return file_path
+    taken = {p.lower() for p in in_run_paths}
+    counter = 1
+    while file_path.lower() in taken:
+        file_path = os.path.join(out_dir, f"{stem} ({counter}).md")
+        counter += 1
+    in_run_paths.add(file_path)
+    return file_path
 
 
 # ---------------------------------------------------------------------------
@@ -1135,16 +1213,7 @@ def export_notebook(
     topic: sqlite3.Row,
     out_root: str,
     options: RenderOptions,
-    parent_titles: list[str] | None = None,
-    visited_topics: set[str] | None = None,
 ) -> list[ExportResult]:
-    if visited_topics is None:
-        visited_topics = set()
-    if topic["ZTOPICID"] in visited_topics:
-        return []
-    visited_topics.add(topic["ZTOPICID"])
-
-    parent_titles = parent_titles or []
     title = topic["ZTITLE"] or "Untitled"
     is_mindmap = bool(topic["ZMINDLINKS"])
 
@@ -1160,7 +1229,8 @@ def export_notebook(
     if topic["ZBOOKLIST"]:
         book_md5_list.extend([m for m in topic["ZBOOKLIST"].split("|") if m])
     note_book_set = {n["ZBOOKMD5"] for n in notes if n["ZBOOKMD5"]}
-    for m in note_book_set:
+    # set 迭代顺序受 PYTHONHASHSEED 影响，必须排序，否则 bookId / books 顺序每次运行都可能变。
+    for m in sorted(note_book_set):
         if m not in book_md5_list:
             book_md5_list.append(m)
     book_infos = fetch_book_titles(ctx, book_md5_list)
@@ -1174,16 +1244,8 @@ def export_notebook(
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(assets_dir, exist_ok=True)
 
-    file_stem = " - ".join([sanitize_filename(t) for t in [*parent_titles, title]])
-    file_path = os.path.join(out_dir, f"{file_stem}.md")
-    counter = 1
-    in_run_paths = options.generated_paths
-    if in_run_paths is not None:
-        # 仅在本次运行内撞名时才加 (1)/(2)；vault 里上次的旧文件不再算占位。
-        while file_path in in_run_paths:
-            file_path = os.path.join(out_dir, f"{file_stem} ({counter}).md")
-            counter += 1
-        in_run_paths.add(file_path)
+    # 仅在本次运行内撞名时才加 (1)/(2)；vault 里上次的旧文件不再算占位。
+    file_path = _allocate_md_path(out_dir, sanitize_filename(title), options.generated_paths)
 
     # 渲染
     roots = build_tree(notes)
@@ -1328,7 +1390,9 @@ def export_notebook(
     if changed:
         print(f"   ✏️  {title} → {file_path}（{stats.note_count} 条笔记 / {stats.image_count} 张图）")
 
-    results = [ExportResult(
+    # ZCHILDMAPNOTEID 指向的是同一 Topic 内的脑图根节点（ZNOTEID），不是另一个
+    # Topic；子脑图内容已经随本 Topic 的 fetch_notes 一起导出，无需递归。
+    return [ExportResult(
         topic_id=topic["ZTOPICID"],
         title=title,
         file_path=file_path,
@@ -1337,34 +1401,6 @@ def export_notebook(
         image_count=stats.image_count,
         changed=changed,
     )]
-
-    # 递归子思维导图（Books-only 模式下跳过）
-    if not options.recurse_child_maps:
-        return results
-    cursor = ctx.conn.cursor()
-    child_topic_ids: list[tuple[str, str]] = []
-    for n in notes:
-        cmid = n["ZCHILDMAPNOTEID"]
-        if not cmid:
-            continue
-        # cmid 实际是 ZNOTEID 还是 ZTOPICID，存在两种情况，按 ZTOPIC 查最稳妥
-        cursor.execute("SELECT ZTOPICID, ZTITLE, ZMINDLINKS, ZBOOKLIST, ZDATE FROM ZTOPIC WHERE ZTOPICID = ?", (cmid,))
-        row = cursor.fetchone()
-        if row:
-            child_topic_ids.append((row, n["ZNOTETITLE"] or "Untitled"))  # type: ignore[arg-type]
-
-    new_parents = [*parent_titles, title]
-    for child_topic, child_title in child_topic_ids:
-        try:
-            sub = export_notebook(
-                ctx, child_topic, out_root, options,
-                parent_titles=new_parents, visited_topics=visited_topics,
-            )
-            results.extend(sub)
-        except Exception as exc:  # noqa: BLE001
-            print(f"   ⚠️ 子思维导图 {child_title} 导出失败: {exc}")
-
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1629,14 @@ def _fetch_topic_lastvisits(
     return out
 
 
+# 笔记本被删除后，其 ZBOOKNOTE 行可能残留（ZTOPICID 指向不存在的 Topic）。
+# 这些笔记在 MarginNote 里已不可见，导出时必须排除，否则会"复活"成未知书籍。
+_LIVE_TOPIC_COND = (
+    "(bn.ZTOPICID IS NULL OR EXISTS "
+    "(SELECT 1 FROM ZTOPIC lt WHERE lt.ZTOPICID = bn.ZTOPICID))"
+)
+
+
 def list_books(ctx: DBContext) -> list[dict]:
     """列出所有"被笔记引用过"的书：以 ZBOOKNOTE.ZBOOKMD5 为准，
     再到 ZBOOK 里反查标题/作者；ZBOOK 中找不到的（旧数据 / 已删除）
@@ -1604,10 +1648,10 @@ def list_books(ctx: DBContext) -> list[dict]:
     的笔记合并、污染书内内容。
     """
     cursor = ctx.conn.cursor()
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT bn.ZBOOKMD5 AS md5, COUNT(*) AS note_count
         FROM ZBOOKNOTE bn
-        WHERE bn.ZBOOKMD5 IS NOT NULL
+        WHERE bn.ZBOOKMD5 IS NOT NULL AND {_LIVE_TOPIC_COND}
         GROUP BY bn.ZBOOKMD5
     """)
     rows = [r for r in cursor.fetchall() if not r["md5"].endswith(STUDY_SET_SUFFIX)]
@@ -1767,6 +1811,15 @@ def _split_card_links(text: str) -> tuple[str, list[str]]:
     return cleaned, ids
 
 
+def _image_identity(blob: bytes | None) -> bytes | str | None:
+    """图片的身份标识：优先 paint hash，否则原始字节；无图返回 None。"""
+    if not blob:
+        return None
+    if blob.startswith(b"bplist"):
+        return extract_paint_hash(blob) or blob
+    return blob
+
+
 def _key_for_book_note(r: sqlite3.Row) -> tuple:
     """跨 topic 去重时的"同一段摘录"识别 key。
 
@@ -1875,10 +1928,7 @@ def _emit_image_para(
     trailing_link: str | None = None,
 ) -> bool:
     image_filename = f"{note_id}.png"
-    image_path = os.path.join(images_dir, image_filename)
-    if not os.path.exists(image_path):
-        with open(image_path, "wb") as f:
-            f.write(image_data)
+    _write_bytes_if_changed(os.path.join(images_dir, image_filename), image_data)
     rel = f"{options.image_dir_relative}/{image_filename}"
     alt = f"|{options.image_width}" if options.image_width and options.image_width > 0 else ""
     lines.append(f"![{alt}]({rel})")
@@ -2052,7 +2102,7 @@ def _render_book_node_weread(
 
     note = node.note
     is_ai_answer = is_ai_answer_node(note)
-    if is_ai_answer and not options.keep_ai_nodes:
+    if is_ai_context_node(note) or (is_ai_answer and not options.keep_ai_nodes):
         for child in node.children:
             _render_book_node_weread(
                 child, level, lines, images_dir, media_map, note_hash_map,
@@ -2421,14 +2471,22 @@ def _image_ext(data: bytes) -> str:
     return "png"
 
 
+def _find_existing_cover(assets_dir: str, book_id: str) -> str | None:
+    """assets 里已有 ``cover-<bookId>.<ext>`` 时返回文件名。"""
+    for ext in ("png", "jpg", "gif", "webp"):
+        filename = f"cover-{book_id}.{ext}"
+        if os.path.isfile(os.path.join(assets_dir, filename)):
+            return filename
+    return None
+
+
 def _write_cover_asset(assets_dir: str, book_id: str, data: bytes) -> str:
     """把封面写入 ``assets/cover-<bookId>.<ext>``（已存在同名则复用），返回文件名。"""
     ext = _image_ext(data)
     filename = f"cover-{book_id}.{ext}"
     p = os.path.join(assets_dir, filename)
     if not os.path.isfile(p):
-        with open(p, "wb") as f:
-            f.write(data)
+        _write_bytes_if_changed(p, data)
     return filename
 
 
@@ -2491,12 +2549,16 @@ def _collect_weread_meta(
     book_id: str | None = None
     if picked is not None:
         book_id, src = picked
-        try:
-            data = _cover_bytes(src)
-        except Exception:
-            data = None
-        if data:
-            name = _write_cover_asset(assets_dir, book_id, data)
+        # 已有封面直接复用，不再每次都调 qlmanage / zip 重新渲染。
+        name = _find_existing_cover(assets_dir, book_id)
+        if name is None:
+            try:
+                data = _cover_bytes(src)
+            except Exception:
+                data = None
+            if data:
+                name = _write_cover_asset(assets_dir, book_id, data)
+        if name:
             meta["cover"] = f"{image_dir_relative}/{name}"
     if book_id is None and md5_list:
         info = sources.get(md5_list[0])
@@ -2565,7 +2627,7 @@ def export_book(
             t.ZTITLE AS topic_title, t.ZMINDLINKS AS topic_mindlinks
         FROM ZBOOKNOTE bn
         LEFT JOIN ZTOPIC t ON t.ZTOPICID = bn.ZTOPICID
-        WHERE bn.ZBOOKMD5 IN ({placeholders})
+        WHERE bn.ZBOOKMD5 IN ({placeholders}) AND {_LIVE_TOPIC_COND}
         ORDER BY bn.ZTOPICID, bn.ZSTARTPAGE, bn.ZSTARTPOS, bn.ZNOTEID
         """,
         md5_list,
@@ -2686,6 +2748,15 @@ def export_book(
                 label = _label_norm(r)
                 if label:
                     primary = main_keys_loose.get((r["ZSTARTPAGE"] or 0, label))
+            # 合并只搬运批注文本；补充 note 自带的图片与主节点不同时，合并会把图片
+            # 丢掉，改走 standalone 完整渲染。
+            if (
+                primary is not None
+                and r["ZNOTEID"] != primary["ZNOTEID"]
+                and _image_identity(r["ZHIGHLIGHT_PIC"]) not in (None, _image_identity(primary["ZHIGHLIGHT_PIC"]))
+            ):
+                standalone.append((ttitle, r))
+                continue
             if primary is not None:
                 if not r["ZNOTES_TEXT"]:
                     continue
@@ -2731,18 +2802,11 @@ def export_book(
     assets_dir = os.path.join(out_root, "assets")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(assets_dir, exist_ok=True)
-    safe_name = sanitize_filename(title)
-    file_path = os.path.join(out_dir, f"{safe_name}.md")
-    counter = 1
     # 仅在"同次运行内"撞名（比如两本书 fallback title 完全相同但没合并）才加
     # 后缀；vault 里上次的同名文件保留 mtime —— 真正的覆盖判定交给
     # _write_if_changed 做。
     in_run_paths = options.generated_paths
-    if in_run_paths is not None:
-        while file_path in in_run_paths:
-            file_path = os.path.join(out_dir, f"{safe_name} ({counter}).md")
-            counter += 1
-        in_run_paths.add(file_path)
+    file_path = _allocate_md_path(out_dir, sanitize_filename(title), in_run_paths)
 
     # 图片相对路径：md 在 Books/[A/B/...]/foo.md，从那里到 assets/ 要 ../ 回退几层。
     # Books 这层占 1 级，folder_segs 各占 1 级。
@@ -3094,13 +3158,19 @@ def parse_args() -> argparse.Namespace:
              "ctime/inode），只有 MarginNote 那边真改了笔记才会更新对应文件。本次运行未"
              "再生成的旧 .md（MarginNote 端删除/改名/移目录）会被当成孤儿删掉，让 vault 与"
              "MarginNote 当前状态保持一致。加 --no-clean 关闭孤儿清理（保留所有旧文件，仅"
-             "做内容增量更新）。--id 单本调试模式自动跳过孤儿清理。",
+             "做内容增量更新）。清理只针对本次导出范围对应的子目录（--by-book / --books-only"
+             " → Books/，--mindmaps-only → MindMaps/，--all → 两者），且只删带本工具"
+             " frontmatter 标记的文件；--id 与交互式挑选模式、或本次有导出失败时自动跳过清理。",
+    )
+    p.add_argument(
+        "--with-mindmaps", action="store_true",
+        help="--by-book 模式下额外按 Topic 导出思维导图到 MindMaps/（含不绑定书的自由脑图）。",
     )
     scope = p.add_mutually_exclusive_group()
     scope.add_argument("--books-only", action="store_true",
                        help="只导出书籍类 Topic（无 ZMINDLINKS）")
     scope.add_argument("--mindmaps-only", action="store_true",
-                       help="只导出思维导图 Topic（含子思维导图）")
+                       help="只导出思维导图 Topic")
     scope.add_argument("--by-book", action="store_true",
                        help="按 PDF 聚合：把同一本书在所有 Topic 中的笔记合并到一份 markdown")
     return p.parse_args()
@@ -3155,18 +3225,69 @@ def _write_if_changed(path: str, content: str) -> bool:
             with open(path, "r", encoding="utf-8") as f:
                 if f.read() == content:
                     return False
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    _atomic_write(path, content.encode("utf-8"))
     return True
 
 
-def _list_existing_md(out_root: str) -> set[str]:
-    """扫描 out/Books 与 out/MindMaps 下所有现存的 .md 绝对路径。"""
+def _write_bytes_if_changed(path: str, data: bytes) -> bool:
+    """二进制版 _write_if_changed：图片在 MarginNote 里被修改后也能更新到 vault。"""
+    if os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                if f.read() == data:
+                    return False
+        except OSError:
+            pass
+    _atomic_write(path, data)
+    return True
+
+
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """先写同目录临时文件再 rename：中途中断不会留下半截文件（输出目录常在 iCloud 里）。"""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mnsync-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o666 & ~_UMASK)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# 本工具 / Obsidian 插件生成的 md 在 frontmatter 里都带 doc_type: "marginnote-…"。
+_MANAGED_MARKER_RE = re.compile(r'^doc_type:\s*"?marginnote-', re.M)
+
+
+def _is_managed_md(path: str) -> bool:
+    """只把带本工具 frontmatter 标记的文件当作可清理对象，用户手写的 md 永不删除。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            head = f.read(4096)
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not head.startswith("---"):
+        return False
+    end = head.find("\n---", 3)
+    frontmatter = head[: end if end >= 0 else len(head)]
+    return bool(_MANAGED_MARKER_RE.search(frontmatter))
+
+
+def _list_existing_md(out_root: str, subdirs: Iterable[str]) -> set[str]:
+    """扫描指定子目录下所有现存的 .md 路径。"""
     found: set[str] = set()
-    for sub in ("Books", "MindMaps"):
+    for sub in subdirs:
         base = os.path.join(out_root, sub)
         if not os.path.isdir(base):
             continue
@@ -3177,24 +3298,28 @@ def _list_existing_md(out_root: str) -> set[str]:
     return found
 
 
-def _prune_orphans(out_root: str, kept_files: set[str]) -> int:
+def _prune_orphans(out_root: str, kept_files: set[str], subdirs: Iterable[str]) -> int:
     """删掉上次生成、本次未再生成的 .md（孤儿），并清理变空的目录。
 
     这样可以同步 MarginNote 端的删除 / 改名 / 移目录操作，但**不会动**
-    本次仍然存在的文件（mtime 保持原样）。assets/ 保留——图片孤儿不影响
-    渲染，避免反复 IO 大体积图片。同时把残留的 INDEX.md 也清掉。
+    本次仍然存在的文件（mtime 保持原样）。只扫描本次导出范围对应的子目录，
+    且只删带 ``doc_type: marginnote-*`` 标记的文件。assets/ 保留——图片孤儿
+    不影响渲染，避免反复 IO 大体积图片。同时把残留的 INDEX.md 也清掉。
     """
-    existing = _list_existing_md(out_root)
+    subdirs = list(subdirs)
+    existing = _list_existing_md(out_root, subdirs)
     orphans = existing - kept_files
     removed = 0
-    for p in orphans:
+    for p in sorted(orphans):
+        if not _is_managed_md(p):
+            continue
         try:
             os.remove(p)
             removed += 1
         except OSError:
             pass
     # 清空目录（自下而上）
-    for sub in ("Books", "MindMaps"):
+    for sub in subdirs:
         base = os.path.join(out_root, sub)
         if not os.path.isdir(base):
             continue
@@ -3231,25 +3356,43 @@ def main() -> None:
     options = RenderOptions(
         keep_ai_nodes=args.keep_ai,
         url_scheme=ctx.url_scheme,
-        recurse_child_maps=not args.books_only,
         image_width=max(0, args.image_width),
         generated_paths=generated_paths,
     )
     out_root = args.out
     os.makedirs(out_root, exist_ok=True)
 
-    def _summarize(label: str, results: list[ExportResult]) -> None:
+    def _summarize(
+        label: str,
+        results: list[ExportResult],
+        prune_subdirs: tuple[str, ...],
+        failures: int,
+    ) -> None:
         changed = sum(1 for r in results if r.changed)
         unchanged = len(results) - changed
-        if args.clean and not args.topic_id:
-            removed = _prune_orphans(out_root, generated_paths)
-            tail = f"，🧹 清理孤儿 {removed} 个" if removed else ""
-        else:
-            tail = ""
+        tail = ""
+        if failures:
+            # 失败的书 / 笔记本没登记进 generated_paths，此时清理会误删它们上次导出的文件。
+            tail = f"，⚠️ {failures} 个导出失败，本次跳过孤儿清理"
+        elif args.clean and prune_subdirs:
+            removed = _prune_orphans(out_root, generated_paths, prune_subdirs)
+            if removed:
+                tail = f"，🧹 清理孤儿 {removed} 个"
         print(
             f"\n🎉 完成！共 {len(results)} {label} —— ✏️ 实写 {changed}，"
             f"♻️ 未变化 {unchanged}{tail}。"
         )
+
+    def _export_topics(targets: list[sqlite3.Row], results: list[ExportResult]) -> int:
+        # 按创建时间 + ID 稳定排序：同名笔记本的 (1)/(2) 后缀不再随"最近访问"漂移。
+        failures = 0
+        for topic in sorted(targets, key=lambda t: (t["ZDATE"] or 0, t["ZTOPICID"])):
+            try:
+                results.extend(export_notebook(ctx, topic, out_root, options))
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"   ⚠️ {topic['ZTITLE']} 导出失败: {exc}")
+        return failures
 
     # ---- 模式 1：按书聚合 ----
     if args.by_book:
@@ -3274,14 +3417,28 @@ def main() -> None:
         if args.group_by_folder:
             print("   📁 已启用按 MarginNote 文件夹分组（--no-folder-grouping 可关闭）")
         all_results: list[ExportResult] = []
-        for meta in books:
+        failures = 0
+        # 按 md5 稳定排序：同名书的 (1)/(2) 后缀不随笔记数变化而互换。
+        for meta in sorted(books, key=lambda b: (b.get("md5_list") or [b["md5"]])[0]):
             try:
                 r = export_book(ctx, meta, out_root, options)
                 if r:
                     all_results.append(r)
             except Exception as exc:  # noqa: BLE001
+                failures += 1
                 print(f"   ⚠️ 《{meta['title']}》导出失败: {exc}")
-        _summarize("本书", all_results)
+        prune_subdirs: tuple[str, ...] = ("Books",)
+        if args.with_mindmaps:
+            mind_topics = _filter_by_scope(list_notebooks(ctx), False, True)
+            print(f"\n思维导图：发现 {len(mind_topics)} 个，开始导出至 {out_root}")
+            failures += _export_topics(mind_topics, all_results)
+            prune_subdirs = ("Books", "MindMaps")
+        _summarize(
+            "个文件" if args.with_mindmaps else "本书",
+            all_results,
+            () if args.topic_id else prune_subdirs,
+            failures,
+        )
         return
 
     # ---- 模式 2：按 Topic ----
@@ -3290,6 +3447,9 @@ def main() -> None:
         print("⚠️ 未发现任何笔记本。")
         return
 
+    # 只有"全量导出某个范围"时才能安全清理该范围的子目录；--id / 交互式挑选
+    # 只导出了一部分，清理会把没选中的文件全部当孤儿删掉。
+    prune_subdirs: tuple[str, ...] = ()
     if args.topic_id:
         targets = [n for n in notebooks if n["ZTOPICID"] == args.topic_id]
         if not targets:
@@ -3297,6 +3457,12 @@ def main() -> None:
             sys.exit(1)
     elif args.all or args.books_only or args.mindmaps_only:
         targets = _filter_by_scope(notebooks, args.books_only, args.mindmaps_only)
+        if args.books_only:
+            prune_subdirs = ("Books",)
+        elif args.mindmaps_only:
+            prune_subdirs = ("MindMaps",)
+        else:
+            prune_subdirs = ("Books", "MindMaps")
     else:
         scoped = _filter_by_scope(notebooks, args.books_only, args.mindmaps_only)
         targets = interactive_choice(scoped)
@@ -3314,15 +3480,8 @@ def main() -> None:
 
     print(f"\n开始导出 {len(targets)} 个笔记本（范围：{scope_desc}）至 {out_root}")
     all_results = []
-    visited: set[str] = set()
-    for topic in targets:
-        try:
-            sub = export_notebook(ctx, topic, out_root, options, visited_topics=visited)
-            all_results.extend(sub)
-        except Exception as exc:  # noqa: BLE001
-            print(f"   ⚠️ {topic['ZTITLE']} 导出失败: {exc}")
-
-    _summarize("个文件", all_results)
+    failures = _export_topics(targets, all_results)
+    _summarize("个文件", all_results, prune_subdirs, failures)
 
 
 if __name__ == "__main__":

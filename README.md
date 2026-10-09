@@ -9,8 +9,8 @@ License: [MIT](LICENSE)
 
 | 入口 | 适合场景 | 链接 |
 | --- | --- | --- |
-| **Python CLI**（功能最全） | 需要按"书"聚合、文件夹分组、图片提取、子思维导图递归等高级能力，或在 CI 中无人值守跑 | 见下方"快速开始" |
-| **Obsidian 插件**（v0.3.0） | 在 Obsidian 内一键同步，支持 by-book / 文件夹分组 / 子思维导图 | [`obsidian-plugin/`](obsidian-plugin/README.md) · [安装说明](obsidian-plugin/README.md#安装) |
+| **Python CLI**（功能最全） | 需要按"书"聚合、文件夹分组、图片提取等高级能力，或在 CI 中无人值守跑 | 见下方"快速开始" |
+| **Obsidian 插件**（v0.3.0） | 在 Obsidian 内一键同步，支持 by-book / 文件夹分组 / 思维导图 | [`obsidian-plugin/`](obsidian-plugin/README.md) · [安装说明](obsidian-plugin/README.md#安装) |
 
 两者数据库读取规则、Markdown 渲染规则共享同一份"事实标准"，所以混用同步同一个 vault 也不会冲突。
 
@@ -137,13 +137,20 @@ MarginNote_Exports/Books/
 - frontmatter 里的"时间戳"字段已经改成只反映内容真实更新时间：
   - `lastNoteUpdate`：取本书 / 本笔记本所有节点的最大 `ZNOTE_DATE` / `ZHIGHLIGHT_DATE`；
   - **去掉了**每次都变的 `exported: <运行时刻>`，避免它让"内容比对"永远 fail。
-- 收尾会做一次**孤儿清理**：本次未再生成、但 vault 里还有的 `Books/*.md` / `MindMaps/*.md`（以及残留的 `INDEX.md`）会被删掉，同步 MarginNote 端的删除 / 改名 / 移目录操作；变空的子目录也会被一并 `rmdir`。
-- `assets/` 不清理 —— 图片以 `ZNOTEID` 命名稳定，孤儿图片不影响渲染，能避免反复写几百兆 IO。
+- 收尾会做一次**孤儿清理**：本次未再生成、但 vault 里还有的旧 `.md`（以及残留的 `INDEX.md`）会被删掉，同步 MarginNote 端的删除 / 改名 / 移目录操作；变空的子目录也会被一并 `rmdir`。清理有三道保护：
+  - **只清理本次导出范围对应的子目录**：`--by-book` / `--books-only` → `Books/`，`--mindmaps-only` → `MindMaps/`，`--all`（或 `--by-book --with-mindmaps`）→ 两者；
+  - **只删带本工具 frontmatter 标记**（`doc_type: "marginnote-…"`）的文件，你手写放进去的 md 不会被动；
+  - **本次有任何一本导出失败就整体跳过清理**，避免把失败那本上次的文件当孤儿删掉。
+- `assets/` 不清理 —— 图片以 `ZNOTEID` 命名稳定，孤儿图片不影响渲染。图片内容在 MarginNote 里被修改时会按字节比对后更新。
+- 所有写入都是"临时文件 + rename"的原子写，中途中断不会留下半截文件。
 
 可选开关：
 
 - `--no-clean`：保留所有旧的 `.md` 文件（关闭孤儿清理），仅做内容增量更新。适合你在 vault 里手动整理过、不希望工具帮你删的场景。
-- `--id <prefix>`：单本调试模式自动跳过孤儿清理（只动指定那本）。
+- `--id <prefix>` 与交互式挑选：只导出了部分笔记本，自动跳过孤儿清理。
+- `--with-mindmaps`：`--by-book` 模式下额外按 Topic 导出思维导图到 `MindMaps/`（含不绑定书的自由脑图）。
+
+数据读取：数据库以 `mode=ro` 打开并在整轮导出中保持同一个读事务快照，能读到 MarginNote 尚未合并进主文件的 WAL 写入；只有在无法访问 `-shm` 时才退回 `immutable` 快照模式（此时会提示可能读不到最新笔记）。已删除笔记本残留的笔记不会被导出。
 
 跑完后命令行会汇总成 `共 414 本书 —— ✏️ 实写 0，♻️ 未变化 414，🧹 清理孤儿 0 个`，可以一眼看出本次到底动了哪些文件。
 
@@ -155,7 +162,7 @@ MarginNote_Exports/
 │   ├── <根级书名>.md
 │   └── <MarginNote 文件夹>/
 │       └── <书名>.md
-├── MindMaps/         # 思维导图（含子思维导图，按"父 - 子"命名）
+├── MindMaps/         # 思维导图（同一 Topic 内的子脑图一并包含在该文件中）
 │   └── <思维导图>.md
 └── assets/           # 所有引用到的图片，按 ZNOTEID 命名
     └── <ZNOTEID>.png
@@ -258,14 +265,13 @@ sort noteCount desc
 
 所有图片统一存放在 `assets/`，文件名为 `{ZNOTEID}.png`，Markdown 内以相对路径引用。
 
-### 8. 子思维导图递归导出
+### 8. 子思维导图与文件命名
 
-若节点的 `ZCHILDMAPNOTEID` 非空，会把它作为新的 Topic 递归导出，并：
+`ZCHILDMAPNOTEID` 指向的是**同一 Topic 内**的脑图根节点（`ZNOTEID`），不是另一个 Topic，因此子脑图的内容会随所在 Topic 一起导出，不再单独递归成文件。
 
-- 始终输出到 `MindMaps/` 目录。
-- 文件名前缀按"父标题 - 子标题"拼接，去掉 Obsidian wikilink 不友好的字符（`#`、`[`、`]`、`|`、`/` 等）。
-- 同名时自动加 `(1)`、`(2)` 后缀。
-- 通过全局 `visited_topics` 集合防止 mindmap 自循环。
+- 文件名去掉 Obsidian wikilink 不友好的字符（`#`、`^`、`[`、`]`、`|`、`/` 等）及开头的 `.`，按 UTF-8 字节截断以免超出文件名长度上限。
+- 同名时自动加 `(1)`、`(2)` 后缀，比较时不区分大小写（macOS 默认文件系统大小写不敏感）；导出顺序按创建时间 / md5 稳定排序，后缀不会随"最近访问"在同名笔记本之间漂移。
+- `ZMINDLINKS` 出现多父或成环时，节点只挂在第一个父节点下，环会被拆开，不丢节点。
 
 ### 9. Tags / 分类
 
