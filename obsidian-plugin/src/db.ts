@@ -20,6 +20,9 @@ import type { BookMeta, BookNoteRow, Note, Topic } from "./types";
 
 const MNDOC_PATH_PREFIX = "$$$MNDOCLINK$$$";
 const CATEGORY_PREFIX = /^\$\$\$CATEGORY\d+\$\$\$/;
+// MarginNote 给"不绑定单一文档的自由脑图"建的虚拟文档 ZBOOKMD5 以此结尾，
+// 不属于真实的书，by-book 聚合（Books/）时必须排除，只让它走 MindMaps/。
+const STUDY_SET_SUFFIX = "_StudySet";
 const FILE_EXT_RE = /\.(pdf|epub|mobi|txt|docx?|mp4|pptx?|html?)$/i;
 
 // ---------- 图片字节工具 ----------
@@ -493,12 +496,15 @@ export class MarginDb {
 
   /** 列出所有被笔记引用过的书（按 ZBOOKMD5 聚合）。 */
   listBooks(): BookMeta[] {
-    const countRows = this.db
-      .prepare(
-        `SELECT ZBOOKMD5 AS md5, COUNT(*) AS noteCount
-         FROM ZBOOKNOTE WHERE ZBOOKMD5 IS NOT NULL GROUP BY ZBOOKMD5`
-      )
-      .all() as { md5: string; noteCount: number }[];
+    // 排除 _StudySet 自由脑图虚拟文档：其笔记全是 AI 节点，不属于真实的书。
+    const countRows = (
+      this.db
+        .prepare(
+          `SELECT ZBOOKMD5 AS md5, COUNT(*) AS noteCount
+           FROM ZBOOKNOTE WHERE ZBOOKMD5 IS NOT NULL GROUP BY ZBOOKMD5`
+        )
+        .all() as { md5: string; noteCount: number }[]
+    ).filter((r) => !r.md5.endsWith(STUDY_SET_SUFFIX));
 
     const md5Meta = new Map<string, BookMeta>();
     for (const r of countRows) {

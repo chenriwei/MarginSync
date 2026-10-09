@@ -60,6 +60,9 @@ OUTPUT_DIR = "MarginNote_Exports"
 # macOS NSDate 起始（2001-01-01）距离 unix epoch 的秒数。
 NSDATE_EPOCH_OFFSET = 978307200
 
+# MarginNote 给"不绑定单一文档的自由脑图"建的虚拟文档，其 ZBOOKMD5 以此结尾。
+STUDY_SET_SUFFIX = "_StudySet"
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -1593,7 +1596,13 @@ def _fetch_topic_lastvisits(
 def list_books(ctx: DBContext) -> list[dict]:
     """列出所有"被笔记引用过"的书：以 ZBOOKNOTE.ZBOOKMD5 为准，
     再到 ZBOOK 里反查标题/作者；ZBOOK 中找不到的（旧数据 / 已删除）
-    用 Topic 标题兜底。"""
+    用 Topic 标题兜底。
+
+    注意要排除 ``<hash>_StudySet``：那是 MarginNote 给"不绑定单一文档的
+    自由脑图"自动建的虚拟文档（笔记全是 ZTYPE=9 的 AI 节点），不属于真实
+    的书。它只该出现在 MindMaps/，不能进 Books/，否则还会和同名真实书
+    的笔记合并、污染书内内容。
+    """
     cursor = ctx.conn.cursor()
     cursor.execute("""
         SELECT bn.ZBOOKMD5 AS md5, COUNT(*) AS note_count
@@ -1601,7 +1610,7 @@ def list_books(ctx: DBContext) -> list[dict]:
         WHERE bn.ZBOOKMD5 IS NOT NULL
         GROUP BY bn.ZBOOKMD5
     """)
-    rows = cursor.fetchall()
+    rows = [r for r in cursor.fetchall() if not r["md5"].endswith(STUDY_SET_SUFFIX)]
 
     md5_meta: dict[str, dict] = {}
     for r in rows:
